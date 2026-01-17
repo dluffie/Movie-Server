@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { mkdir, writeFile } from 'fs/promises'
+import { createWriteStream } from 'fs'
 import path from 'path'
 import { exec } from 'child_process'
 import ffmpeg from 'fluent-ffmpeg'
@@ -7,11 +8,11 @@ import ffmpeg from 'fluent-ffmpeg'
 export async function POST(req: NextRequest) {
   try {
     const formData = await req.formData()
-    const file = formData.get('file') as File
+    const userFile = formData.get('file') as File
     const title = formData.get('title') as string
     const description = formData.get('description') as string
 
-    if (!file || !title) {
+    if (!userFile || !title) {
       return NextResponse.json({ error: 'Missing file or title' }, { status: 400 })
     }
 
@@ -21,10 +22,21 @@ export async function POST(req: NextRequest) {
     // Create directory
     await mkdir(uploadDir, { recursive: true })
 
-    // Save input file
-    const buffer = Buffer.from(await file.arrayBuffer())
+    // Save input file streamed
     const inputPath = path.join(uploadDir, 'input.mp4')
-    await writeFile(inputPath, buffer)
+    // @ts-ignore
+    const stream = userFile.stream()
+    const reader = stream.getReader()
+    const writer = createWriteStream(inputPath)
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      writer.write(value)
+    }
+    writer.end()
+
+    // GC Pause
+    await new Promise(r => setTimeout(r, 1000))
 
     // Save metadata
     const metadata = {
@@ -62,7 +74,7 @@ export async function POST(req: NextRequest) {
 
     // Start FFmpeg HLS conversion in background (fire and forget)
     const hlsPath = path.join(uploadDir, 'movie.m3u8')
-    const command = `ffmpeg -i "${inputPath}" -codec:v h264 -codec:a aac -hls_time 6 -hls_playlist_type vod "${hlsPath}"`
+    const command = `ffmpeg -i "${inputPath}" -threads 1 -preset ultrafast -codec:v h264 -codec:a aac -hls_time 6 -hls_playlist_type vod "${hlsPath}"`
 
     console.log(`Starting HLS conversion for ${slug}...`)
     exec(command, (error, stdout, stderr) => {
