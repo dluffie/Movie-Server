@@ -4,6 +4,7 @@ import { useState } from 'react'
 
 export default function UploadPage() {
     const [file, setFile] = useState<File | null>(null)
+    const [poster, setPoster] = useState<File | null>(null)
     const [title, setTitle] = useState('')
     const [desc, setDesc] = useState('')
     const [status, setStatus] = useState('')
@@ -14,27 +15,48 @@ export default function UploadPage() {
         if (!file || !title) return
 
         setLoading(true)
-        setStatus('Uploading...')
+        setStatus('Uploading Video...')
 
         try {
-            // Use raw body upload to avoid FormData buffering
+            // 1. Upload Video
             const res = await fetch('/api/upload', {
                 method: 'POST',
                 headers: {
                     'X-Upload-Title': encodeURIComponent(title),
                     'X-Upload-Desc': encodeURIComponent(desc),
-                    'Content-Type': 'application/octet-stream', // Important to handle as raw
+                    'X-Skip-Poster-Gen': poster ? 'true' : 'false',
+                    'Content-Type': 'application/octet-stream',
                 },
                 body: file,
-                // @ts-ignore - 'duplex' is a new fetch option for streaming bodies
+                // @ts-ignore
                 duplex: 'half'
             })
 
             if (res.ok) {
-                setStatus('Upload successful! Processing started. It may take a few minutes to appear.')
+                const data = await res.json()
+                const slug = data.slug
+
+                // 2. Upload Poster (if selected)
+                if (poster && slug) {
+                    setStatus('Video uploaded. Uploading Poster...')
+                    const posterRes = await fetch(`/api/upload/poster?slug=${slug}`, {
+                        method: 'POST',
+                        body: poster
+                    })
+                    if (!posterRes.ok) {
+                        console.error('Poster upload failed')
+                        setStatus('Video uploaded, but Poster upload failed.')
+                    } else {
+                        setStatus('Upload successful! Processing started.')
+                    }
+                } else {
+                    setStatus('Upload successful! Processing started. It may take a few minutes to appear.')
+                }
+
                 setTitle('')
                 setDesc('')
                 setFile(null)
+                setPoster(null)
             } else if (res.status === 429) {
                 setStatus('Server is busy processing another video. Please wait a few minutes and try again.')
             } else {
@@ -75,6 +97,17 @@ export default function UploadPage() {
                         rows={4}
                         placeholder="Movie plot..."
                     />
+                </div>
+
+                <div>
+                    <label className="block mb-2 font-medium">Poster Image (Optional)</label>
+                    <input
+                        type="file"
+                        accept="image/*"
+                        onChange={(e) => setPoster(e.target.files?.[0] || null)}
+                        className="w-full p-2 bg-gray-700 rounded border border-gray-600"
+                    />
+                    <p className="text-xs text-gray-400 mt-1">Leave empty to auto-generate from video.</p>
                 </div>
 
                 <div>

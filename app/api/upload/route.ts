@@ -88,28 +88,34 @@ export async function POST(req: NextRequest) {
     await writeFile(path.join(uploadDir, 'metadata.json'), JSON.stringify(metadata, null, 2))
 
     // 6. Generate Thumbnail (Fast)
-    try {
-      await new Promise((resolve, reject) => {
-        ffmpeg(inputPath)
-          .on('end', () => {
-            console.log(`Poster generated for ${slug}`)
-            resolve(true)
-          })
-          .on('error', (err) => {
-            console.error(`Poster generation failed for ${slug}:`, err)
-            // Don't reject, poster is optional
-            resolve(false)
-          })
-          .screenshots({
-            count: 1,
-            folder: uploadDir,
-            filename: 'poster.jpg',
-            timestamps: ['10%'],
-            size: '320x?'
-          })
-      })
-    } catch (e) {
-      console.error("Non-fatal error generating poster:", e)
+    const skipPoster = req.headers.get('X-Skip-Poster-Gen') === 'true'
+
+    if (!skipPoster) {
+      try {
+        await new Promise((resolve, reject) => {
+          ffmpeg(inputPath)
+            .on('end', () => {
+              console.log(`Poster generated for ${slug}`)
+              resolve(true)
+            })
+            .on('error', (err) => {
+              console.error(`Poster generation failed for ${slug}:`, err)
+              // Don't reject, poster is optional
+              resolve(false)
+            })
+            .screenshots({
+              count: 1,
+              folder: uploadDir,
+              filename: 'poster.jpg',
+              timestamps: ['10%'],
+              size: '320x?'
+            })
+        })
+      } catch (e) {
+        console.error("Non-fatal error generating poster:", e)
+      }
+    } else {
+      console.log(`Skipping poster generation for ${slug} (Custom poster provided)`)
     }
 
     // 7. Start HLS Conversion (Background, Low Priority)
@@ -163,9 +169,30 @@ export async function POST(req: NextRequest) {
             let outputOptions: string[] = []
 
             if (mode === 'semi-turbo') {
-              outputOptions = ['-c:v copy', '-c:a aac', '-hls_time 6', '-hls_playlist_type vod', '-hls_segment_filename', path.join(uploadDir, `file_${i}_%03d.ts`)]
+              // COPY Video, Encode Audio (AAC) but MAP ALL STREAMS
+              // Actually, to keep dual audio, maybe we should COPY audio too?
+              // But semi-turbo was intended to handle formats incompatible with stream copy?
+              // If we use re-encode, we should map 0 and use aac.
+              outputOptions = [
+                '-map 0',
+                '-c:v copy',
+                '-c:a aac',
+                '-hls_time 6',
+                '-hls_playlist_type vod',
+                '-hls_segment_filename', path.join(uploadDir, `file_${i}_%03d.ts`)
+              ]
             } else {
-              outputOptions = ['-threads 1', '-preset ultrafast', '-codec:v h264', '-codec:a aac', '-hls_time 6', '-hls_playlist_type vod', '-hls_segment_filename', path.join(uploadDir, `file_${i}_%03d.ts`)]
+              // SAFE: Re-encode Everything. Map 0 = all streams.
+              outputOptions = [
+                '-map 0',
+                '-threads 1',
+                '-preset ultrafast',
+                '-codec:v h264',
+                '-codec:a aac',
+                '-hls_time 6',
+                '-hls_playlist_type vod',
+                '-hls_segment_filename', path.join(uploadDir, `file_${i}_%03d.ts`)
+              ]
             }
 
             ffmpeg(chunkInput)
@@ -173,34 +200,16 @@ export async function POST(req: NextRequest) {
               .output(chunkHls)
               .on('end', resolve)
               .on('error', (err) => {
-                // If semi-turbo fails, we should technically fall back to safe for THIS chunk, 
-                // but to keep it simple, if semi-turbo fails anywhere, we abort to full safe?
-                // actually, let's just reject and let the outer catch switch to safe
                 reject(err)
               })
               .run()
           })
 
-          // Delete the intermediate chunk MP4 to save header/disk space immediately? 
-          // Maybe keep until verifying? No, delete to save space on phone.
+          // Delete the intermediate chunk MP4
           await unlink(chunkInput).catch(() => { })
         }
 
-        // 3. Merge Playlists (Actually, we just need to cat the segments or create a master playlist?
-        // Simpler: Just concat the .ts files? No, header HLS is tricky.
-        // HLS allows discontinuous segments. 
-        // We need to manually stitch the .m3u8 files.
-        // Simplified approach for now:
-        // Since we are HLS, we can just list all the .ts files we generated in order in a new master m3u8.
-
-        // This part is complex to get right manually. 
-        // Alternative: Just run the main conversion but with -restart? No.
-
-        // Let's rely on standard logic: 
-        // If we are here, we successfully processed all chunks.
-        // We need to generate the final movie.m3u8.
-        // We can read all out_X.m3u8, extract #EXTINF lines, and combine them.
-
+        // 3. Merge Playlists
         let masterPlaylist = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
 
         for (let i = 0; i < totalChunks; i++) {
@@ -214,10 +223,7 @@ export async function POST(req: NextRequest) {
               masterPlaylist += line + "\n"
             }
           })
-          // Add discontinuity between chunks to be safe if timestamps reset
           masterPlaylist += "#EXT-X-DISCONTINUITY\n"
-
-          // Cleanup out_X.m3u8
           await unlink(path.join(uploadDir, `out_${i}.m3u8`)).catch(() => { })
         }
 
@@ -243,16 +249,15 @@ export async function POST(req: NextRequest) {
       console.log(`Attempting conversion in ${mode} mode for ${slug}`)
 
       if (mode !== 'turbo') {
-        // If not turbo, use the memory-safe Chunked converter immediately
         runChunkedConversion(mode)
         return
       }
 
-      // Turbo Logic (Same as before)
+      // Turbo Logic
       ffmpeg(inputPath)
         .outputOptions([
-          '-c:v copy',
-          '-c:a copy',
+          '-map 0',          // INCLUDE ALL STREAMS (Dual Audio / Subs)
+          '-c copy',         // COPY EVERYTHING
           '-hls_time 6',
           '-hls_playlist_type vod'
         ])
