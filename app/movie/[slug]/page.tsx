@@ -45,11 +45,37 @@ export default function PlayerPage() {
         }
     }, [slug])
 
+    const handleDelete = async () => {
+        if (!confirm('Are you sure you want to delete this movie permanently? This cannot be undone.')) return
+
+        try {
+            const res = await fetch(`/api/movie/${slug}`, { method: 'DELETE' })
+            if (res.ok) {
+                window.location.href = '/'
+            } else {
+                alert('Failed to delete movie.')
+            }
+        } catch (e) {
+            alert('Error deleting movie')
+        }
+    }
+
     return (
         <div className="min-h-screen bg-black flex flex-col items-center justify-center relative">
-            <Link href="/" className="absolute top-6 left-6 text-white bg-gray-800 px-4 py-2 rounded hover:bg-gray-700 z-10">
-                ← Back to Home
-            </Link>
+            <div className="absolute top-6 left-6 z-10 flex gap-4">
+                <Link href="/" className="text-white bg-gray-800 px-4 py-2 rounded hover:bg-gray-700">
+                    ← Back to Home
+                </Link>
+            </div>
+
+            <div className="absolute top-6 right-6 z-10">
+                <button
+                    onClick={handleDelete}
+                    className="text-white bg-red-800 px-4 py-2 rounded hover:bg-red-900 border border-red-700"
+                >
+                    DELETE MOVIE
+                </button>
+            </div>
 
             <div className="w-full max-w-6xl aspect-video bg-black relative shadow-2xl">
                 <video
