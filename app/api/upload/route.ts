@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { mkdir, writeFile } from 'fs/promises'
+import { mkdir, writeFile, stat, unlink, readdir, readFile } from 'fs/promises'
 import { createWriteStream } from 'fs'
 import path from 'path'
 import { exec } from 'child_process'
@@ -11,7 +11,18 @@ import { Readable } from 'stream'
 export const dynamic = 'force-dynamic'
 
 export async function POST(req: NextRequest) {
+  const lockFile = path.resolve('./processing.lock')
+
   try {
+    // 0. Check Processing Lock
+    try {
+      await stat(lockFile)
+      // If stat succeeds, file exists -> BUSY
+      return NextResponse.json({ error: 'Server is busy processing another video. Please wait.' }, { status: 429 })
+    } catch (e) {
+      // File does not exist -> Free to proceed
+    }
+
     // 1. Validate Headers
     const titleHeader = req.headers.get('X-Upload-Title')
     const descHeader = req.headers.get('X-Upload-Desc')
@@ -28,6 +39,9 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Missing file body' }, { status: 400 })
     }
 
+    // CREATE LOCK
+    await writeFile(lockFile, JSON.stringify({ title, startTime: Date.now() }))
+
     const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-')
     const uploadDir = path.resolve('./movies', slug)
 
@@ -43,7 +57,13 @@ export async function POST(req: NextRequest) {
     const nodeStream = Readable.fromWeb(req.body)
 
     // Write file
-    await pipeline(nodeStream, writer)
+    try {
+      await pipeline(nodeStream, writer)
+    } catch (writeErr) {
+      // If upload fails, clear lock
+      await unlink(lockFile).catch(() => { })
+      throw writeErr
+    }
 
     // 5. Save Metadata
     const metadata = {
@@ -64,7 +84,8 @@ export async function POST(req: NextRequest) {
           })
           .on('error', (err) => {
             console.error(`Poster generation failed for ${slug}:`, err)
-            reject(err)
+            // Don't reject, poster is optional
+            resolve(false)
           })
           .screenshots({
             count: 1,
@@ -87,22 +108,138 @@ export async function POST(req: NextRequest) {
 
     console.log(`Starting HLS conversion for ${slug}...`)
 
-    const runConversion = (mode: 'turbo' | 'safe') => {
-      const isTurbo = mode === 'turbo'
+    const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
+    const runChunkedConversion = async (mode: 'semi-turbo' | 'safe') => {
+      console.log(`Starting CHUNKED conversion in ${mode} mode for ${slug}`)
+
+      try {
+        // 1. Split into 5-min chunks (Instant Copy)
+        const segmentPattern = path.join(uploadDir, 'chunk_%03d.mp4')
+        await new Promise((resolve, reject) => {
+          ffmpeg(inputPath)
+            .outputOptions(['-c copy', '-map 0', '-segment_time 300', '-f segment', '-reset_timestamps 1'])
+            .output(segmentPattern)
+            .on('end', resolve)
+            .on('error', reject)
+            .run()
+        })
+
+        // 2. Process each chunk
+        // We need to find how many chunks were created
+        const chunks = (await readdir(uploadDir)).filter(f => f.startsWith('chunk_') && f.endsWith('.mp4')).sort()
+
+        let totalChunks = chunks.length
+        console.log(`Split into ${totalChunks} chunks. Processing...`)
+
+        for (let i = 0; i < totalChunks; i++) {
+          const chunkName = chunks[i]
+          const chunkInput = path.join(uploadDir, chunkName)
+          const chunkHls = path.join(uploadDir, `out_${i}.m3u8`)
+
+          // Update Status
+          const overallProgress = Math.round((i / totalChunks) * 100)
+          await writeFile(statusPath, JSON.stringify({ status: 'processing', progress: overallProgress, mode: `${mode} (chunk ${i + 1}/${totalChunks})` }))
+
+          // Cool down
+          await sleep(1000)
+
+          // Convert Chunk
+          await new Promise((resolve, reject) => {
+            // Define options based on mode
+            let outputOptions: string[] = []
+
+            if (mode === 'semi-turbo') {
+              outputOptions = ['-c:v copy', '-c:a aac', '-hls_time 6', '-hls_playlist_type vod', '-hls_segment_filename', path.join(uploadDir, `file_${i}_%03d.ts`)]
+            } else {
+              outputOptions = ['-threads 1', '-preset ultrafast', '-codec:v h264', '-codec:a aac', '-hls_time 6', '-hls_playlist_type vod', '-hls_segment_filename', path.join(uploadDir, `file_${i}_%03d.ts`)]
+            }
+
+            ffmpeg(chunkInput)
+              .outputOptions(outputOptions)
+              .output(chunkHls)
+              .on('end', resolve)
+              .on('error', (err) => {
+                // If semi-turbo fails, we should technically fall back to safe for THIS chunk, 
+                // but to keep it simple, if semi-turbo fails anywhere, we abort to full safe?
+                // actually, let's just reject and let the outer catch switch to safe
+                reject(err)
+              })
+              .run()
+          })
+
+          // Delete the intermediate chunk MP4 to save header/disk space immediately? 
+          // Maybe keep until verifying? No, delete to save space on phone.
+          await unlink(chunkInput).catch(() => { })
+        }
+
+        // 3. Merge Playlists (Actually, we just need to cat the segments or create a master playlist?
+        // Simpler: Just concat the .ts files? No, header HLS is tricky.
+        // HLS allows discontinuous segments. 
+        // We need to manually stitch the .m3u8 files.
+        // Simplified approach for now:
+        // Since we are HLS, we can just list all the .ts files we generated in order in a new master m3u8.
+
+        // This part is complex to get right manually. 
+        // Alternative: Just run the main conversion but with -restart? No.
+
+        // Let's rely on standard logic: 
+        // If we are here, we successfully processed all chunks.
+        // We need to generate the final movie.m3u8.
+        // We can read all out_X.m3u8, extract #EXTINF lines, and combine them.
+
+        let masterPlaylist = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+
+        for (let i = 0; i < totalChunks; i++) {
+          const chunkContent = await readFile(path.join(uploadDir, `out_${i}.m3u8`), 'utf-8')
+          const lines = chunkContent.split('\n')
+          lines.forEach(line => {
+            if (line.startsWith('#EXTINF') || line.endsWith('.ts')) {
+              masterPlaylist += line + "\n"
+            }
+            if (line.startsWith('#EXT-X-DISCONTINUITY')) {
+              masterPlaylist += line + "\n"
+            }
+          })
+          // Add discontinuity between chunks to be safe if timestamps reset
+          masterPlaylist += "#EXT-X-DISCONTINUITY\n"
+
+          // Cleanup out_X.m3u8
+          await unlink(path.join(uploadDir, `out_${i}.m3u8`)).catch(() => { })
+        }
+
+        masterPlaylist += "#EXT-X-ENDLIST"
+        await writeFile(hlsPath, masterPlaylist)
+
+        console.log(`Chunked conversion complete for ${slug}`)
+        await writeFile(statusPath, JSON.stringify({ status: 'ready', progress: 100, mode })).catch(() => { })
+        await unlink(lockFile).catch(() => { })
+
+      } catch (e) {
+        console.error(`Chunked ${mode} failed`, e)
+        if (mode === 'semi-turbo') {
+          await runChunkedConversion('safe')
+        } else {
+          await writeFile(statusPath, JSON.stringify({ status: 'error', error: 'Conversion failed' })).catch(() => { })
+          await unlink(lockFile).catch(() => { })
+        }
+      }
+    }
+
+    const runConversion = (mode: 'turbo' | 'semi-turbo' | 'safe') => {
       console.log(`Attempting conversion in ${mode} mode for ${slug}`)
 
+      if (mode !== 'turbo') {
+        // If not turbo, use the memory-safe Chunked converter immediately
+        runChunkedConversion(mode)
+        return
+      }
+
+      // Turbo Logic (Same as before)
       ffmpeg(inputPath)
-        .outputOptions(isTurbo ? [
+        .outputOptions([
           '-c:v copy',
           '-c:a copy',
-          '-hls_time 6',
-          '-hls_playlist_type vod'
-        ] : [
-          '-threads 1',
-          '-preset ultrafast',
-          '-codec:v h264',
-          '-codec:a aac',
           '-hls_time 6',
           '-hls_playlist_type vod'
         ])
@@ -116,18 +253,16 @@ export async function POST(req: NextRequest) {
         .on('end', () => {
           console.log(`FFmpeg HLS finished for ${slug} in ${mode} mode`)
           writeFile(statusPath, JSON.stringify({ status: 'ready', progress: 100, mode })).catch(() => { })
+          unlink(lockFile).catch(() => console.error('Failed to clear lock'))
         })
         .on('error', (err) => {
           console.error(`FFmpeg error in ${mode} mode for ${slug}:`, err.message)
 
-          if (isTurbo) {
-            console.log(`Turbo mode failed, switching to Safe mode for ${slug}...`)
-            // Update status and try safe mode
-            writeFile(statusPath, JSON.stringify({ status: 'processing', progress: 0, mode: 'safe' })).catch(() => { })
-            runConversion('safe')
-          } else {
-            // Safe mode failed too, real error
-            writeFile(statusPath, JSON.stringify({ status: 'error', error: err.message })).catch(() => { })
+          if (mode === 'turbo') {
+            console.log(`Turbo mode failed, switching to Semi-Turbo (Chunked) mode for ${slug}...`)
+            writeFile(statusPath, JSON.stringify({ status: 'processing', progress: 0, mode: 'semi-turbo' })).catch(() => { })
+            // Switch to CHUNKED for safety
+            runChunkedConversion('semi-turbo')
           }
         })
         .run()
@@ -140,6 +275,8 @@ export async function POST(req: NextRequest) {
 
   } catch (error) {
     console.error('Upload error:', error)
+    // Try to clear lock if generic error
+    await unlink(path.resolve('./processing.lock')).catch(() => { })
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 })
   }
 }
