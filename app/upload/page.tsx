@@ -16,15 +16,18 @@ export default function UploadPage() {
         setLoading(true)
         setStatus('Uploading...')
 
-        const formData = new FormData()
-        formData.append('file', file)
-        formData.append('title', title)
-        formData.append('description', desc)
-
         try {
+            // Use raw body upload to avoid FormData buffering
             const res = await fetch('/api/upload', {
                 method: 'POST',
-                body: formData,
+                headers: {
+                    'X-Upload-Title': encodeURIComponent(title),
+                    'X-Upload-Desc': encodeURIComponent(desc),
+                    'Content-Type': 'application/octet-stream', // Important to handle as raw
+                },
+                body: file,
+                // @ts-ignore - 'duplex' is a new fetch option for streaming bodies
+                duplex: 'half'
             })
 
             if (res.ok) {
