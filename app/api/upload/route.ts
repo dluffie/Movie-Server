@@ -269,9 +269,14 @@ export async function POST(req: NextRequest) {
     }
 
     // Start with Turbo mode
-    runConversion('turbo')
+    // CRITICAL: We MUST delay initialization to allow Next.js to compile the status page.
+    // If we start immediately, Next.js Compiler + FFmpeg = OOM Crash on Termux.
+    console.log(`Scheduling conversion for ${slug} in 10 seconds...`)
+    setTimeout(() => {
+      runConversion('turbo')
+    }, 10000) // 10s delay
 
-    return NextResponse.json({ success: true, slug, message: 'Upload received. Conversion started.' })
+    return NextResponse.json({ success: true, slug, message: 'Upload received. Conversion scheduled.' })
 
   } catch (error) {
     console.error('Upload error:', error)
