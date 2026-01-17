@@ -80,17 +80,41 @@ export async function POST(req: NextRequest) {
 
     // 7. Start HLS Conversion (Background, Low Priority)
     const hlsPath = path.join(uploadDir, 'movie.m3u8')
-    // -threads 1 -preset ultrafast is CRITICAL for Termux stability
-    const command = `ffmpeg -i "${inputPath}" -threads 1 -preset ultrafast -codec:v h264 -codec:a aac -hls_time 6 -hls_playlist_type vod "${hlsPath}"`
+    const statusPath = path.join(uploadDir, 'status.json')
+
+    // Initial status
+    await writeFile(statusPath, JSON.stringify({ status: 'processing', progress: 0 }))
 
     console.log(`Starting HLS conversion for ${slug}...`)
-    exec(command, (error, stdout, stderr) => {
-      if (error) {
-        console.error(`FFmpeg HLS error for ${slug}:`, error)
-      } else {
+
+    // Use fluent-ffmpeg for better control and progress tracking
+    ffmpeg(inputPath)
+      .outputOptions([
+        '-threads 1', // Critical for Termux
+        '-preset ultrafast',
+        '-codec:v h264',
+        '-codec:a aac',
+        '-hls_time 6',
+        '-hls_playlist_type vod'
+      ])
+      .output(hlsPath)
+      .on('progress', (progress) => {
+        // progress.percent is a number 0-100
+        if (progress.percent) {
+          const percent = Math.round(progress.percent)
+          // Write status (fire and forget, don't await to avoid blocking)
+          writeFile(statusPath, JSON.stringify({ status: 'processing', progress: percent })).catch(() => { })
+        }
+      })
+      .on('end', () => {
         console.log(`FFmpeg HLS finished for ${slug}`)
-      }
-    })
+        writeFile(statusPath, JSON.stringify({ status: 'ready', progress: 100 })).catch(() => { })
+      })
+      .on('error', (err) => {
+        console.error(`FFmpeg HLS error for ${slug}:`, err)
+        writeFile(statusPath, JSON.stringify({ status: 'error', error: err.message })).catch(() => { })
+      })
+      .run()
 
     return NextResponse.json({ success: true, slug, message: 'Upload received and poster generated.' })
 
