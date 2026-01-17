@@ -83,40 +83,60 @@ export async function POST(req: NextRequest) {
     const statusPath = path.join(uploadDir, 'status.json')
 
     // Initial status
-    await writeFile(statusPath, JSON.stringify({ status: 'processing', progress: 0 }))
+    await writeFile(statusPath, JSON.stringify({ status: 'processing', progress: 0, mode: 'turbo' }))
 
     console.log(`Starting HLS conversion for ${slug}...`)
 
-    // Use fluent-ffmpeg for better control and progress tracking
-    ffmpeg(inputPath)
-      .outputOptions([
-        '-threads 1', // Critical for Termux
-        '-preset ultrafast',
-        '-codec:v h264',
-        '-codec:a aac',
-        '-hls_time 6',
-        '-hls_playlist_type vod'
-      ])
-      .output(hlsPath)
-      .on('progress', (progress) => {
-        // progress.percent is a number 0-100
-        if (progress.percent) {
-          const percent = Math.round(progress.percent)
-          // Write status (fire and forget, don't await to avoid blocking)
-          writeFile(statusPath, JSON.stringify({ status: 'processing', progress: percent })).catch(() => { })
-        }
-      })
-      .on('end', () => {
-        console.log(`FFmpeg HLS finished for ${slug}`)
-        writeFile(statusPath, JSON.stringify({ status: 'ready', progress: 100 })).catch(() => { })
-      })
-      .on('error', (err) => {
-        console.error(`FFmpeg HLS error for ${slug}:`, err)
-        writeFile(statusPath, JSON.stringify({ status: 'error', error: err.message })).catch(() => { })
-      })
-      .run()
+    const runConversion = (mode: 'turbo' | 'safe') => {
+      const isTurbo = mode === 'turbo'
 
-    return NextResponse.json({ success: true, slug, message: 'Upload received and poster generated.' })
+      console.log(`Attempting conversion in ${mode} mode for ${slug}`)
+
+      ffmpeg(inputPath)
+        .outputOptions(isTurbo ? [
+          '-c:v copy',
+          '-c:a copy',
+          '-hls_time 6',
+          '-hls_playlist_type vod'
+        ] : [
+          '-threads 1',
+          '-preset ultrafast',
+          '-codec:v h264',
+          '-codec:a aac',
+          '-hls_time 6',
+          '-hls_playlist_type vod'
+        ])
+        .output(hlsPath)
+        .on('progress', (progress) => {
+          if (progress.percent) {
+            const percent = Math.round(progress.percent)
+            writeFile(statusPath, JSON.stringify({ status: 'processing', progress: percent, mode })).catch(() => { })
+          }
+        })
+        .on('end', () => {
+          console.log(`FFmpeg HLS finished for ${slug} in ${mode} mode`)
+          writeFile(statusPath, JSON.stringify({ status: 'ready', progress: 100, mode })).catch(() => { })
+        })
+        .on('error', (err) => {
+          console.error(`FFmpeg error in ${mode} mode for ${slug}:`, err.message)
+
+          if (isTurbo) {
+            console.log(`Turbo mode failed, switching to Safe mode for ${slug}...`)
+            // Update status and try safe mode
+            writeFile(statusPath, JSON.stringify({ status: 'processing', progress: 0, mode: 'safe' })).catch(() => { })
+            runConversion('safe')
+          } else {
+            // Safe mode failed too, real error
+            writeFile(statusPath, JSON.stringify({ status: 'error', error: err.message })).catch(() => { })
+          }
+        })
+        .run()
+    }
+
+    // Start with Turbo mode
+    runConversion('turbo')
+
+    return NextResponse.json({ success: true, slug, message: 'Upload received. Conversion started.' })
 
   } catch (error) {
     console.error('Upload error:', error)
