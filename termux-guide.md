@@ -28,6 +28,27 @@ nginx -c $PWD/nginx.conf
 npm run dev
 ```
 
+
 The app will be available at `http://localhost:3000`.
 Upload movies via `http://localhost:3000/upload`.
 They will be transcoded and served via Nginx on port 8080.
+
+## Troubleshooting
+
+### Nginx "Address already in use"
+If you see `bind() to 0.0.0.0:8080 failed`, it means Nginx is already running.
+Run this to stop it, then try starting it again:
+```bash
+pkill nginx
+nginx -c $PWD/nginx.conf
+```
+
+### Server Restarts on Upload
+If the server restarts (shows "Compiling...") when you upload a movie, ensure your `next.config.ts` has the `watchOptions` to ignore the `movies` folder. This is critical for Termux stability.
+
+### Stream Error (bufferAddCodecError)
+This usually means the video file is corrupt because the conversion was interrupted. 
+1. Delete the corrupt movie folder from `movies/`.
+2. Ensure the server doesn't restart on upload.
+3. Upload again.
+
