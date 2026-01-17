@@ -35,8 +35,11 @@ export default function UploadPage() {
                 setTitle('')
                 setDesc('')
                 setFile(null)
+            } else if (res.status === 429) {
+                setStatus('Server is busy processing another video. Please wait a few minutes and try again.')
             } else {
-                setStatus('Upload failed.')
+                const data = await res.json().catch(() => ({}))
+                setStatus(`Upload failed: ${data.message || data.error || 'Unknown error'}`)
             }
         } catch (err) {
             console.error(err)

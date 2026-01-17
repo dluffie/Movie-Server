@@ -19,9 +19,9 @@ export async function POST(req: NextRequest) {
     try {
       const lockStats = await stat(lockFile)
 
-      // Check for Stale Lock (> 1 hour) or Forced Upload
+      // Check for Stale Lock (> 5 minutes) or Forced Upload
       const lockAgeMs = Date.now() - lockStats.mtimeMs
-      const isStale = lockAgeMs > 60 * 60 * 1000 // 1 hour
+      const isStale = lockAgeMs > 5 * 60 * 1000 // 5 minutes
       const forceUpload = req.headers.get('X-Force-Upload') === 'true'
 
       if (isStale || forceUpload) {
@@ -29,8 +29,8 @@ export async function POST(req: NextRequest) {
         await unlink(lockFile).catch(() => { })
       } else {
         // If stat succeeds and not stale/forced, file exists -> BUSY
-        console.log('Server is busy. Lock exists and is recent.')
-        return NextResponse.json({ error: 'Server is busy processing another video. Please wait.' }, { status: 429 })
+        console.log(`Server is busy. Lock exists and is recent (Age: ${Math.round(lockAgeMs / 1000)}s).`)
+        return NextResponse.json({ error: 'Server is busy processing another video. Please wait 5 minutes or restart server.' }, { status: 429 })
       }
     } catch (e) {
       // File does not exist -> Free to proceed
