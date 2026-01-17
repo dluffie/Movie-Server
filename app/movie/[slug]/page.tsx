@@ -9,8 +9,10 @@ export default function PlayerPage() {
     const { slug } = useParams()
     const videoRef = useRef<HTMLVideoElement>(null)
     const [error, setError] = useState('')
+    const [status, setStatus] = useState<'loading' | 'playing' | 'error'>('loading')
+    const retryTimeout = useRef<NodeJS.Timeout | null>(null)
 
-    useEffect(() => {
+    const initPlayer = () => {
         if (!slug) return
 
         const video = videoRef.current
@@ -23,25 +25,60 @@ export default function PlayerPage() {
             const hls = new Hls()
             hls.loadSource(src)
             hls.attachMedia(video)
+
             hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                setStatus('playing')
                 video.play().catch(e => console.log('Autoplay blocked', e))
+                setError('')
             })
+
             hls.on(Hls.Events.ERROR, (event, data) => {
                 if (data.fatal) {
-                    setError(`Stream error: ${data.details}`)
+                    switch (data.type) {
+                        case Hls.ErrorTypes.NETWORK_ERROR:
+                            console.log('Network error, retrying in 5s...')
+                            setStatus('loading')
+                            hls.destroy()
+                            retryTimeout.current = setTimeout(initPlayer, 5000)
+                            break
+                        case Hls.ErrorTypes.MEDIA_ERROR:
+                            console.log('Media error, trying verification...')
+                            hls.recoverMediaError()
+                            break
+                        default:
+                            setStatus('error')
+                            setError(`Stream error: ${data.details}`)
+                            hls.destroy()
+                            break
+                    }
                 }
             })
-            return () => {
-                hls.destroy()
-            }
+            return hls
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            // Native HLS support (Safari/iOS)
+            // Native HLS support
             video.src = src
             video.addEventListener('loadedmetadata', () => {
+                setStatus('playing')
                 video.play()
             })
+            video.addEventListener('error', () => {
+                setStatus('loading')
+                retryTimeout.current = setTimeout(initPlayer, 5000)
+            })
+            return null
         } else {
+            setStatus('error')
             setError('HLS not supported in this browser.')
+            return null
+        }
+    }
+
+    useEffect(() => {
+        const hlsInstance = initPlayer()
+
+        return () => {
+            if (hlsInstance) hlsInstance.destroy()
+            if (retryTimeout.current) clearTimeout(retryTimeout.current)
         }
     }, [slug])
 
@@ -77,16 +114,26 @@ export default function PlayerPage() {
                 </button>
             </div>
 
-            <div className="w-full max-w-6xl aspect-video bg-black relative shadow-2xl">
+            <div className="w-full max-w-6xl aspect-video bg-black relative shadow-2xl flex items-center justify-center">
                 <video
                     ref={videoRef}
                     controls
-                    className="w-full h-full"
+                    className={`w-full h-full ${status === 'playing' ? 'block' : 'hidden'}`}
                     poster={`http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:8080/hls/${slug}/poster.jpg`}
                 />
-                {error && (
-                    <div className="absolute inset-0 flex items-center justify-center bg-black/80 text-red-500 z-20">
-                        <p className="text-xl font-bold">{error}</p>
+
+                {status === 'loading' && (
+                    <div className="text-center">
+                        <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-red-600 mx-auto mb-4"></div>
+                        <p className="text-white text-xl">Processing Video... Please wait.</p>
+                        <p className="text-gray-400 text-sm mt-2">Checking stream status...</p>
+                    </div>
+                )}
+
+                {status === 'error' && (
+                    <div className="text-red-500 text-center p-4 bg-black/80 rounded">
+                        <p className="text-xl font-bold mb-2">Error Playing Video</p>
+                        <p>{error}</p>
                     </div>
                 )}
             </div>
