@@ -133,14 +133,22 @@ export async function POST(req: NextRequest) {
       console.log(`Starting CHUNKED conversion in ${mode} mode for ${slug}`)
 
       try {
-        // 1. Split into 5-min chunks (Instant Copy)
+        // 1. Split into 5-min chunks (Instant Copy) - Only video and audio, subs handled separately
         const segmentPattern = path.join(uploadDir, 'chunk_%03d.mp4')
-        await new Promise((resolve, reject) => {
+        await new Promise<void>((resolve, reject) => {
           ffmpeg(inputPath)
-            .outputOptions(['-c copy', '-map 0', '-segment_time 300', '-f segment', '-reset_timestamps 1'])
+            .outputOptions([
+              '-map 0:v:0',           // First video stream
+              '-map 0:a',             // All audio streams
+              '-c copy',              // Copy codec (fast)
+              '-segment_time 300',    // 5 minute chunks
+              '-f segment',
+              '-reset_timestamps 1'
+            ])
             .output(segmentPattern)
-            .on('end', resolve)
-            .on('error', reject)
+            .on('start', (cmd) => console.log(`Segmenting: ${cmd}`))
+            .on('end', () => resolve())
+            .on('error', (err) => reject(err))
             .run()
         })
 
@@ -164,27 +172,26 @@ export async function POST(req: NextRequest) {
           await sleep(1000)
 
           // Convert Chunk
-          await new Promise((resolve, reject) => {
+          await new Promise<void>((resolve, reject) => {
             // Define options based on mode
             let outputOptions: string[] = []
 
             if (mode === 'semi-turbo') {
-              // COPY Video, Encode Audio (AAC) but MAP ALL STREAMS
-              // Actually, to keep dual audio, maybe we should COPY audio too?
-              // But semi-turbo was intended to handle formats incompatible with stream copy?
-              // If we use re-encode, we should map 0 and use aac.
+              // COPY Video, Encode ALL Audio to AAC for HLS compatibility
               outputOptions = [
-                '-map 0',
-                '-c:v copy',
-                '-c:a aac',
+                '-map 0:v:0',         // First video stream
+                '-map 0:a',           // All audio streams  
+                '-c:v copy',          // Copy video
+                '-c:a aac',           // Convert audio to AAC
                 '-hls_time 6',
                 '-hls_playlist_type vod',
                 '-hls_segment_filename', path.join(uploadDir, `file_${i}_%03d.ts`)
               ]
             } else {
-              // SAFE: Re-encode Everything. Map 0 = all streams.
+              // SAFE: Re-encode Everything
               outputOptions = [
-                '-map 0',
+                '-map 0:v:0',         // First video stream
+                '-map 0:a',           // All audio streams
                 '-threads 1',
                 '-preset ultrafast',
                 '-codec:v h264',
@@ -198,8 +205,10 @@ export async function POST(req: NextRequest) {
             ffmpeg(chunkInput)
               .outputOptions(outputOptions)
               .output(chunkHls)
-              .on('end', resolve)
+              .on('start', (cmd) => console.log(`Chunk ${i} conversion: ${cmd}`))
+              .on('end', () => resolve())
               .on('error', (err) => {
+                console.error(`Chunk ${i} error:`, err.message)
                 reject(err)
               })
               .run()
@@ -253,15 +262,26 @@ export async function POST(req: NextRequest) {
         return
       }
 
-      // Turbo Logic
+      // Turbo Logic - First try stream copy (fastest), then fallback
+      // For dual audio: HLS requires AAC audio codec. If input has non-AAC audio, copy will fail.
+      // We'll try copy first, if it fails, we transcode audio only.
       ffmpeg(inputPath)
         .outputOptions([
-          '-map 0',          // INCLUDE ALL STREAMS (Dual Audio / Subs)
-          '-c copy',         // COPY EVERYTHING
+          '-map 0:v:0',      // Map first video stream
+          '-map 0:a',        // Map ALL audio streams
+          '-map 0:s?',       // Map subtitles if present (? = optional)
+          '-c:v copy',       // Copy video (no re-encode)
+          '-c:a aac',        // Convert ALL audio to AAC (HLS requirement for compatibility)
+          '-c:s webvtt',     // Convert subtitles to WebVTT for HLS
           '-hls_time 6',
-          '-hls_playlist_type vod'
+          '-hls_playlist_type vod',
+          '-hls_flags independent_segments',
+          '-master_pl_name', 'master.m3u8'  // Create master playlist for multi-track
         ])
         .output(hlsPath)
+        .on('start', (cmd) => {
+          console.log(`FFmpeg command: ${cmd}`)
+        })
         .on('progress', (progress) => {
           if (progress.percent) {
             const percent = Math.round(progress.percent)
