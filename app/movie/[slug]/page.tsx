@@ -24,26 +24,37 @@ export default function PlayerPage() {
         if (!video) return
 
         const host = window.location.hostname
-        const src = `http://${host}:8080/hls/${slug}/movie.m3u8`
+        // Try master.m3u8 first for multi-audio support, fallback to movie.m3u8
+        const src = `http://${host}:8080/hls/${slug}/master.m3u8`
+        const fallbackSrc = `http://${host}:8080/hls/${slug}/movie.m3u8`
 
         if (Hls.isSupported()) {
-            const hls = new Hls()
+            const hls = new Hls({ debug: false })
             hlsRef.current = hls
+
+            // Try master playlist first
             hls.loadSource(src)
             hls.attachMedia(video)
 
-            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            hls.on(Hls.Events.MANIFEST_PARSED, (e, data) => {
+                console.log('HLS Manifest Parsed:', {
+                    levels: data.levels?.length,
+                    audioTracks: data.audioTracks?.length,
+                    subtitleTracks: data.subtitleTracks?.length
+                })
                 setStatus('playing')
                 video.play().catch(e => console.log('Autoplay blocked', e))
                 setError('')
             })
 
             hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (e, data) => {
+                console.log('Audio Tracks Updated:', data.audioTracks)
                 setAudioTracks(data.audioTracks)
                 setCurrentAudio(hls.audioTrack)
             })
 
             hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (e, data) => {
+                console.log('Subtitle Tracks Updated:', data.subtitleTracks)
                 setSubtitleTracks(data.subtitleTracks)
                 setCurrentSubtitle(hls.subtitleTrack)
             })
