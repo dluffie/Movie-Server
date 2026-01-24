@@ -41,6 +41,18 @@ export default function PlayerPage() {
                     audioTracks: data.audioTracks?.length,
                     subtitleTracks: data.subtitleTracks?.length
                 })
+
+                // Initialize tracks immediately from manifest
+                if (data.audioTracks && data.audioTracks.length > 0) {
+                    setAudioTracks(data.audioTracks)
+                    setCurrentAudio(hls.audioTrack)
+                }
+
+                if (data.subtitleTracks && data.subtitleTracks.length > 0) {
+                    setSubtitleTracks(data.subtitleTracks)
+                    setCurrentSubtitle(hls.subtitleTrack)
+                }
+
                 setStatus('playing')
                 video.play().catch(e => console.log('Autoplay blocked', e))
                 setError('')
