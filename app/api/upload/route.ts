@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { mkdir, writeFile, stat, unlink, readdir, readFile } from 'fs/promises'
 import { createWriteStream } from 'fs'
 import path from 'path'
-import { exec, execSync } from 'child_process'
+import { exec } from 'child_process'
 import ffmpeg from 'fluent-ffmpeg'
 import { pipeline } from 'stream/promises'
 import { Readable } from 'stream'
@@ -262,48 +262,19 @@ export async function POST(req: NextRequest) {
         return
       }
 
-      // Turbo Logic - First try stream copy (fastest), then fallback
-      // For dual audio: HLS requires proper variant playlists with EXT-X-MEDIA tags
-
-      // First, probe the input to count audio streams
-      const probe = execSync(
-        `ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "${inputPath}"`,
-        { encoding: 'utf-8' }
-      ).trim()
-
-      const audioStreamCount = probe.split('\n').filter(l => l.trim()).length
-      console.log(`Detected ${audioStreamCount} audio stream(s) in input`)
-
-      // Build var_stream_map for each audio track
-      // Format: "v:0,a:0 v:0,a:1" for video with 2 audio tracks
-      let varStreamMap = ''
-      if (audioStreamCount > 1) {
-        // Multiple audio: create separate variants for each audio track
-        const variants = []
-        for (let i = 0; i < audioStreamCount; i++) {
-          variants.push(`v:0,a:${i}`)
-        }
-        varStreamMap = variants.join(' ')
-      } else {
-        varStreamMap = 'v:0,a:0'
-      }
-
-      console.log(`Using var_stream_map: ${varStreamMap}`)
-
+      // Turbo Logic - Simple stream copy with audio re-encoding for HLS compatibility
+      // All audio streams are muxed into the same TS segments
       ffmpeg(inputPath)
         .outputOptions([
           '-map 0:v:0',      // Map first video stream
-          '-map 0:a',        // Map ALL audio streams
-          '-c:v copy',       // Copy video (no re-encode)
-          '-c:a aac',        // Convert ALL audio to AAC (HLS requirement for compatibility)
+          '-map 0:a',        // Map ALL audio streams (dual audio support)
+          '-c:v copy',       // Copy video (no re-encode - fast!)
+          '-c:a aac',        // Convert audio to AAC (HLS requirement)
           '-hls_time 6',
           '-hls_playlist_type vod',
-          '-hls_flags independent_segments',
-          '-var_stream_map', varStreamMap,
-          '-master_pl_name', 'master.m3u8',
-          '-hls_segment_filename', path.join(uploadDir, 'stream_%v_%03d.ts')
+          '-hls_segment_filename', path.join(uploadDir, 'segment_%03d.ts')
         ])
-        .output(path.join(uploadDir, 'stream_%v.m3u8'))
+        .output(hlsPath)
         .on('start', (cmd) => {
           console.log(`FFmpeg command: ${cmd}`)
         })
@@ -313,22 +284,8 @@ export async function POST(req: NextRequest) {
             writeFile(statusPath, JSON.stringify({ status: 'processing', progress: percent, mode })).catch(() => { })
           }
         })
-        .on('end', async () => {
+        .on('end', () => {
           console.log(`FFmpeg HLS finished for ${slug} in ${mode} mode`)
-
-          // If master.m3u8 was created, symlink movie.m3u8 to it for compatibility
-          try {
-            const masterPath = path.join(uploadDir, 'master.m3u8')
-            const masterExists = await stat(masterPath).then(() => true).catch(() => false)
-            if (masterExists) {
-              // Copy master to movie.m3u8 so existing player code works
-              const masterContent = await readFile(masterPath, 'utf-8')
-              await writeFile(hlsPath, masterContent)
-            }
-          } catch (e) {
-            console.error('Error copying master playlist:', e)
-          }
-
           writeFile(statusPath, JSON.stringify({ status: 'ready', progress: 100, mode })).catch(() => { })
           unlink(lockFile).catch(() => console.error('Failed to clear lock'))
         })

@@ -24,9 +24,8 @@ export default function PlayerPage() {
         if (!video) return
 
         const host = window.location.hostname
-        // Try master.m3u8 first for multi-audio support, fallback to movie.m3u8
-        const src = `http://${host}:8080/hls/${slug}/master.m3u8`
-        const fallbackSrc = `http://${host}:8080/hls/${slug}/movie.m3u8`
+        // Use movie.m3u8 as primary (created by chunked conversion)
+        const src = `http://${host}:8080/hls/${slug}/movie.m3u8`
 
         if (Hls.isSupported()) {
             const hls = new Hls({ debug: false })
