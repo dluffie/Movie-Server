@@ -6,6 +6,7 @@ import { exec } from 'child_process'
 import ffmpeg from 'fluent-ffmpeg'
 import { pipeline } from 'stream/promises'
 import { Readable } from 'stream'
+import { promisify } from 'util'
 
 // This helps prevent Next.js from complaining about body reading, though App Router handles streams natively.
 export const dynamic = 'force-dynamic'
@@ -254,6 +255,20 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    console.log(`Checking file streams for ${slug}...`)
+
+    // Probe file
+    let audioStreams: any[] = []
+    try {
+      const ffprobe = promisify(ffmpeg.ffprobe)
+      const metadata = await ffprobe(inputPath) as any
+      audioStreams = metadata.streams.filter((s: any) => s.codec_type === 'audio')
+      console.log(`Found ${audioStreams.length} audio streams for ${slug}`)
+    } catch (e) {
+      console.error('Probe failed:', e)
+      // Fallback to basic assumption
+    }
+
     const runConversion = (mode: 'turbo' | 'semi-turbo' | 'safe') => {
       console.log(`Attempting conversion in ${mode} mode for ${slug}`)
 
@@ -263,18 +278,85 @@ export async function POST(req: NextRequest) {
       }
 
       // Turbo Logic - Simple stream copy with audio re-encoding for HLS compatibility
-      // All audio streams are muxed into the same TS segments
-      ffmpeg(inputPath)
-        .outputOptions([
-          '-map 0:v:0',      // Map first video stream
-          '-map 0:a',        // Map ALL audio streams (dual audio support)
-          '-c:v copy',       // Copy video (no re-encode - fast!)
-          '-c:a aac',        // Convert audio to AAC (HLS requirement)
-          '-hls_time 6',
-          '-hls_playlist_type vod',
-          '-hls_segment_filename', path.join(uploadDir, 'segment_%03d.ts')
-        ])
-        .output(hlsPath)
+      const outputOptions = [
+        '-map 0:v:0',      // Map first video stream
+        '-map 0:a',        // Map ALL audio streams
+        '-c:v copy',       // Copy video
+        '-c:a aac',        // AAC Audio
+        '-hls_time 6',
+        '-hls_playlist_type vod',
+        '-hls_list_size 0',
+      ]
+
+      // Dynamic Stream Mapping for Multi-Audio
+      if (audioStreams.length > 0) {
+        // Build var_stream_map
+        // Format: "v:0,agroup:audio a:0,agroup:audio,language:eng ... "
+
+        // Video maps to first video stream and uses audio group 'audio-group'
+        let streamMap = "v:0,agroup:audio-group"
+        let hasLang = false
+
+        audioStreams.forEach((stream, index) => {
+          // Determine language
+          const lang = stream.tags?.language || stream.tags?.TIT2 || `unk${index}`
+          const name = stream.tags?.title || stream.tags?.handler_name || `Audio ${index + 1}`
+
+          // Add to map
+          // Note: a:0 refers to the 0th AUDIO stream mapped? Or the 0th input stream? 
+          // var_stream_map uses output stream indices if we mapped them, OR input designators.
+          // Safest is to map them in order 0:a:0, 0:a:1 etc.
+          // But complex filters happen before mapping.
+          // Let's rely on mapped streams. 
+          // We mapped '-map 0:a', so output audio streams 0, 1, 2... correspond to input audio 0, 1, 2...
+
+          streamMap += ` a:${index},agroup:audio-group`
+
+          if (stream.tags?.language) {
+            streamMap += `,language:${stream.tags.language}`
+            hasLang = true
+          } else {
+            // Try to guess or just leave optional
+            streamMap += `,language:${index}` // default unique
+          }
+
+          // Name is not directly supported in var_stream_map string standard for all versions, 
+          // but we can try setting metadata on the stream before mapping.
+          // For now, let's stick to language which is the critical HLS tag.
+        })
+
+        outputOptions.push(`-var_stream_map`, streamMap)
+
+        // Critical: When using var_stream_map, HLS master playlist generation behavior changes.
+        // We need to specify master playlist name if likely not automatic, but here the output IS the master.
+        // But we need to define segment filename patterns that account for variants.
+        outputOptions.push(`-master_pl_name`, `movie.m3u8`) // actually we might need to output to valid variants
+
+        // When using var_stream_map, the direct output argument should be a pattern for the variant playlists
+        // e.g. "path/to/stream_%v.m3u8"
+        // And master_pl_name creates the master.
+      } else {
+        outputOptions.push('-hls_segment_filename', path.join(uploadDir, 'segment_%03d.ts'))
+      }
+
+      console.log("Derived Options:", outputOptions)
+
+      const command = ffmpeg(inputPath)
+        .outputOptions(outputOptions)
+
+      if (audioStreams.length > 0) {
+        // For var_stream_map, output is the pattern for Media Playlists
+        command.output(path.join(uploadDir, 'stream_%v.m3u8'))
+        // The master playlist is generated due to -master_pl_name
+
+        // WE ALSO Need unique segment names for each stream
+        command.outputOption('-hls_segment_filename', path.join(uploadDir, 'segment_%v_%03d.ts'))
+      } else {
+        // Fallback single file
+        command.output(hlsPath) // movie.m3u8
+      }
+
+      command
         .on('start', (cmd) => {
           console.log(`FFmpeg command: ${cmd}`)
         })
