@@ -367,15 +367,26 @@ export async function POST(req: NextRequest) {
           try {
             const processPlaylist = async (filePath: string) => {
               try {
-                const content = await readFile(filePath, 'utf-8')
-                // Replace both OS specific separator and forward slash just in case
-                const cleanContent = content
-                  .split(uploadDir + path.sep).join('')
-                  .split(uploadDir + '/').join('')
+                let content = await readFile(filePath, 'utf-8')
 
-                await writeFile(filePath, cleanContent)
+                // Debug: Log first few lines before fix
+                console.log(`[FixPaths] Processing ${path.basename(filePath)}. Preview before:`, content.split('\n').slice(0, 5))
+
+                // Robust Replace: Create regex to match uploadDir with either slash
+                // uploadDir is absolute path. We want to remove it + optional trailing slash
+                // Escape special regex chars in uploadDir
+                const escapedDir = uploadDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                const regex = new RegExp(escapedDir + '[\\\\/]*', 'g')
+
+                content = content.replace(regex, '')
+
+                // Also ensure no double slashes at start of lines (if any remain)
+                // content = content.replace(/^[\/\\]+/gm, '') 
+
+                await writeFile(filePath, content)
+                console.log(`[FixPaths] Fixed ${path.basename(filePath)}.`)
               } catch (e) {
-                // Ignore missing files
+                console.warn(`[FixPaths] Could not read/write ${filePath}`, e)
               }
             }
 
@@ -383,12 +394,18 @@ export async function POST(req: NextRequest) {
             await processPlaylist(hlsPath)
 
             // Clean variant playlists if they exist
-            if (audioStreams.length > 0) {
+            // For var_stream_map, we expect stream_0.m3u8, stream_1.m3u8 etc.
+            // We can just list dir and find .m3u8 files
+            try {
               const files = await readdir(uploadDir)
-              const variantPlaylists = files.filter(f => f.startsWith('stream_') && f.endsWith('.m3u8'))
-              for (const vp of variantPlaylists) {
-                await processPlaylist(path.join(uploadDir, vp))
+              const m3u8Files = files.filter(f => f.endsWith('.m3u8') && f !== 'movie.m3u8')
+              console.log(`[FixPaths] Found variants: ${m3u8Files.join(', ')}`)
+
+              for (const f of m3u8Files) {
+                await processPlaylist(path.join(uploadDir, f))
               }
+            } catch (err) {
+              console.error("[FixPaths] Error finding variants:", err)
             }
 
             console.log(`Playlists sanitized for ${slug}`)
