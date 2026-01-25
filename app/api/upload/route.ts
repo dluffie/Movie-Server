@@ -219,6 +219,7 @@ export async function POST(req: NextRequest) {
           await unlink(chunkInput).catch(() => { })
         }
 
+
         // 3. Merge Playlists
         let masterPlaylist = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
 
@@ -226,8 +227,12 @@ export async function POST(req: NextRequest) {
           const chunkContent = await readFile(path.join(uploadDir, `out_${i}.m3u8`), 'utf-8')
           const lines = chunkContent.split('\n')
           lines.forEach(line => {
-            if (line.startsWith('#EXTINF') || line.endsWith('.ts')) {
+            if (line.startsWith('#EXTINF')) {
               masterPlaylist += line + "\n"
+            } else if (line.endsWith('.ts')) {
+              // Fix: Remove absolute path prefix
+              const relativeLine = line.replace(uploadDir + path.sep, '').replace(uploadDir + '/', '')
+              masterPlaylist += relativeLine + "\n"
             }
             if (line.startsWith('#EXT-X-DISCONTINUITY')) {
               masterPlaylist += line + "\n"
@@ -300,16 +305,9 @@ export async function POST(req: NextRequest) {
         audioStreams.forEach((stream, index) => {
           // Determine language
           const lang = stream.tags?.language || stream.tags?.TIT2 || `unk${index}`
-          const name = stream.tags?.title || stream.tags?.handler_name || `Audio ${index + 1}`
+          // const name = stream.tags?.title || stream.tags?.handler_name || `Audio ${index + 1}`
 
           // Add to map
-          // Note: a:0 refers to the 0th AUDIO stream mapped? Or the 0th input stream? 
-          // var_stream_map uses output stream indices if we mapped them, OR input designators.
-          // Safest is to map them in order 0:a:0, 0:a:1 etc.
-          // But complex filters happen before mapping.
-          // Let's rely on mapped streams. 
-          // We mapped '-map 0:a', so output audio streams 0, 1, 2... correspond to input audio 0, 1, 2...
-
           streamMap += ` a:${index},agroup:audio-group`
 
           if (stream.tags?.language) {
@@ -319,10 +317,6 @@ export async function POST(req: NextRequest) {
             // Try to guess or just leave optional
             streamMap += `,language:${index}` // default unique
           }
-
-          // Name is not directly supported in var_stream_map string standard for all versions, 
-          // but we can try setting metadata on the stream before mapping.
-          // For now, let's stick to language which is the critical HLS tag.
         })
 
         outputOptions.push(`-var_stream_map`, streamMap)
@@ -366,8 +360,42 @@ export async function POST(req: NextRequest) {
             writeFile(statusPath, JSON.stringify({ status: 'processing', progress: percent, mode })).catch(() => { })
           }
         })
-        .on('end', () => {
+        .on('end', async () => {
           console.log(`FFmpeg HLS finished for ${slug} in ${mode} mode`)
+
+          // Sanitize Playlists (Remove Absolute Paths)
+          try {
+            const processPlaylist = async (filePath: string) => {
+              try {
+                const content = await readFile(filePath, 'utf-8')
+                // Replace both OS specific separator and forward slash just in case
+                const cleanContent = content
+                  .split(uploadDir + path.sep).join('')
+                  .split(uploadDir + '/').join('')
+
+                await writeFile(filePath, cleanContent)
+              } catch (e) {
+                // Ignore missing files
+              }
+            }
+
+            // Clean master playlist
+            await processPlaylist(hlsPath)
+
+            // Clean variant playlists if they exist
+            if (audioStreams.length > 0) {
+              const files = await readdir(uploadDir)
+              const variantPlaylists = files.filter(f => f.startsWith('stream_') && f.endsWith('.m3u8'))
+              for (const vp of variantPlaylists) {
+                await processPlaylist(path.join(uploadDir, vp))
+              }
+            }
+
+            console.log(`Playlists sanitized for ${slug}`)
+          } catch (e) {
+            console.error('Error sanitizing playlists:', e)
+          }
+
           writeFile(statusPath, JSON.stringify({ status: 'ready', progress: 100, mode })).catch(() => { })
           unlink(lockFile).catch(() => console.error('Failed to clear lock'))
         })
