@@ -1,54 +1,43 @@
-# Termux Setup Guide
+# Termux Setup Guide - LOCFLIX
 
-## 1. Install Dependencies
+## Prerequisites
 ```bash
-pkg update && pkg upgrade
-pkg install nodejs ffmpeg nginx git
+pkg install nodejs ffmpeg
 ```
 
-## 2. Setup Project
-Inside the `Movie-Server` directory:
+## First Time Setup
 ```bash
+cd ~/Movie-Server
 npm install
 ```
 
-## 3. Configure Nginx
-You need to edit the `nginx.conf` file to point to the correct path of your `movies` folder.
-Check the provided `nginx.conf` in this directory. 
-If your project is in `~/Movie-Server`, the alias `/data/data/com.termux/files/home/Movie-Server/movies/` should work.
+## Starting the Server (RECOMMENDED)
 
-To run Nginx with this config:
-```bash
-nginx -c $PWD/nginx.conf
-```
-*Note: You might need to kill existing nginx process first (`pkill nginx`).*
+**Use production mode** — dev mode uses too much RAM and will crash on 2GB devices.
 
-## 4. Run the App
 ```bash
-npm run dev
+# Option 1: Use the startup script
+bash start.sh
+
+# Option 2: Manual build + start
+npm run build
+npm run start:prod
 ```
 
+This will:
+1. Build the production bundle (one-time, ~2-3 min)
+2. Start the server with 256MB memory limit
+3. Listen on `http://0.0.0.0:3000`
 
-The app will be available at `http://localhost:3000`.
-Upload movies via `http://localhost:3000/upload`.
-They will be transcoded and served via Nginx on port 8080.
+## ⚠️ DO NOT use `npm run dev` on low-RAM devices!
+The dev server runs webpack HMR which uses 500MB+ RAM and will cause OOM kills.
 
-## Troubleshooting
+## No Nginx Required!
+All video streaming is now handled directly by Next.js.
+You do NOT need to set up Nginx anymore.
 
-### Nginx "Address already in use"
-If you see `bind() to 0.0.0.0:8080 failed`, it means Nginx is already running.
-Run this to stop it, then try starting it again:
-```bash
-pkill nginx
-nginx -c $PWD/nginx.conf
-```
-
-### Server Restarts on Upload
-If the server restarts (shows "Compiling...") when you upload a movie, ensure your `next.config.ts` has the `watchOptions` to ignore the `movies` folder. This is critical for Termux stability.
-
-### Stream Error (bufferAddCodecError)
-This usually means the video file is corrupt because the conversion was interrupted. 
-1. Delete the corrupt movie folder from `movies/`.
-2. Ensure the server doesn't restart on upload.
-3. Upload again.
-
+## Usage
+1. Open `http://<phone-ip>:3000` on any device on the same WiFi
+2. Upload movies via the Upload page
+3. Wait for conversion to complete
+4. Play movies - stream integrity is verified automatically

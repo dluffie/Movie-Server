@@ -2,39 +2,38 @@ import { NextRequest, NextResponse } from 'next/server'
 import { mkdir, writeFile, stat, unlink, readdir, readFile } from 'fs/promises'
 import { createWriteStream } from 'fs'
 import path from 'path'
-import { exec } from 'child_process'
 import ffmpeg from 'fluent-ffmpeg'
 import { pipeline } from 'stream/promises'
 import { Readable } from 'stream'
 import { promisify } from 'util'
 
-// This helps prevent Next.js from complaining about body reading, though App Router handles streams natively.
 export const dynamic = 'force-dynamic'
+
+// Limit body parser — we handle streaming ourselves
+export const runtime = 'nodejs'
 
 export async function POST(req: NextRequest) {
   const lockFile = path.resolve('./processing.lock')
 
   try {
     // 0. Check Processing Lock
-    console.log(`Checking lock file at: ${lockFile}`)
     try {
       const lockStats = await stat(lockFile)
-
-      // Check for Stale Lock (> 5 minutes) or Forced Upload
       const lockAgeMs = Date.now() - lockStats.mtimeMs
-      const isStale = lockAgeMs > 5 * 60 * 1000 // 5 minutes
+      const isStale = lockAgeMs > 5 * 60 * 1000
       const forceUpload = req.headers.get('X-Force-Upload') === 'true'
 
       if (isStale || forceUpload) {
-        console.warn(`Removing ${isStale ? 'stale' : 'forced'} lock file: ${lockFile}`)
+        console.warn(`Removing ${isStale ? 'stale' : 'forced'} lock file`)
         await unlink(lockFile).catch(() => { })
       } else {
-        // If stat succeeds and not stale/forced, file exists -> BUSY
-        console.log(`Server is busy. Lock exists and is recent (Age: ${Math.round(lockAgeMs / 1000)}s).`)
-        return NextResponse.json({ error: 'Server is busy processing another video. Please wait 5 minutes or restart server.' }, { status: 429 })
+        return NextResponse.json(
+          { error: 'Server is busy processing another video. Please wait.' },
+          { status: 429 }
+        )
       }
-    } catch (e) {
-      // File does not exist -> Free to proceed
+    } catch {
+      // Lock doesn't exist — free to proceed
     }
 
     // 1. Validate Headers
@@ -62,48 +61,33 @@ export async function POST(req: NextRequest) {
     // 3. Create Directory
     await mkdir(uploadDir, { recursive: true })
 
-    // 4. Stream File to Disk (Low RAM usage)
+    // 4. Stream File to Disk (Low RAM)
     const inputPath = path.join(uploadDir, 'input.mp4')
     const writer = createWriteStream(inputPath)
 
-    // Convert Web Stream to Node Stream for pipeline
     // @ts-ignore
     const nodeStream = Readable.fromWeb(req.body)
 
-    // Write file
     try {
       await pipeline(nodeStream, writer)
     } catch (writeErr) {
-      // If upload fails, clear lock
       await unlink(lockFile).catch(() => { })
       throw writeErr
     }
 
     // 5. Save Metadata
-    const metadata = {
-      title,
-      slug,
-      description,
-      duration: 'Unknown'
-    }
+    const metadata = { title, slug, description, duration: 'Unknown' }
     await writeFile(path.join(uploadDir, 'metadata.json'), JSON.stringify(metadata, null, 2))
 
-    // 6. Generate Thumbnail (Fast)
+    // 6. Generate Thumbnail
     const skipPoster = req.headers.get('X-Skip-Poster-Gen') === 'true'
 
     if (!skipPoster) {
       try {
-        await new Promise((resolve, reject) => {
+        await new Promise((resolve) => {
           ffmpeg(inputPath)
-            .on('end', () => {
-              console.log(`Poster generated for ${slug}`)
-              resolve(true)
-            })
-            .on('error', (err) => {
-              console.error(`Poster generation failed for ${slug}:`, err)
-              // Don't reject, poster is optional
-              resolve(false)
-            })
+            .on('end', () => { console.log(`Poster generated for ${slug}`); resolve(true) })
+            .on('error', (err) => { console.error(`Poster error:`, err.message); resolve(false) })
             .screenshots({
               count: 1,
               folder: uploadDir,
@@ -113,336 +97,296 @@ export async function POST(req: NextRequest) {
             })
         })
       } catch (e) {
-        console.error("Non-fatal error generating poster:", e)
+        console.error("Poster generation error (non-fatal):", e)
       }
-    } else {
-      console.log(`Skipping poster generation for ${slug} (Custom poster provided)`)
     }
 
-    // 7. Start HLS Conversion (Background, Low Priority)
+    // 7. Start HLS Conversion (Background)
     const hlsPath = path.join(uploadDir, 'movie.m3u8')
     const statusPath = path.join(uploadDir, 'status.json')
 
-    // Initial status
     await writeFile(statusPath, JSON.stringify({ status: 'processing', progress: 0, mode: 'turbo' }))
-
-    console.log(`Starting HLS conversion for ${slug}...`)
 
     const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
-    const runChunkedConversion = async (mode: 'semi-turbo' | 'safe') => {
-      console.log(`Starting CHUNKED conversion in ${mode} mode for ${slug}`)
+    // ====== SIMPLIFIED CONVERSION ======
+    // Strategy: Always create a SINGLE m3u8 with all audio tracks embedded.
+    // hls.js can switch audio tracks within a single variant — no var_stream_map needed.
+
+    const runTurboConversion = async (): Promise<boolean> => {
+      console.log(`[TURBO] Starting for ${slug}`)
+      return new Promise((resolve) => {
+        ffmpeg(inputPath)
+          .outputOptions([
+            '-map 0:v:0',              // First video stream
+            '-map 0:a?',               // All audio streams (? = don't fail if none)
+            '-c:v copy',               // Copy video (fast)
+            '-c:a aac',                // Re-encode audio to AAC for HLS compat
+            '-ac 2',                   // Stereo (saves memory on decode)
+            '-hls_time 10',            // 10s segments (fewer files, less overhead)
+            '-hls_playlist_type vod',
+            '-hls_list_size 0',
+            '-hls_segment_filename', path.join(uploadDir, 'seg_%03d.ts'),
+          ])
+          .output(hlsPath)
+          .on('start', (cmd) => console.log(`[TURBO] CMD: ${cmd}`))
+          .on('progress', (p) => {
+            if (p.percent) {
+              writeFile(statusPath, JSON.stringify({
+                status: 'processing', progress: Math.round(p.percent), mode: 'turbo'
+              })).catch(() => { })
+            }
+          })
+          .on('end', async () => {
+            console.log(`[TURBO] Complete for ${slug}`)
+            // Sanitize absolute paths from playlist
+            await sanitizePlaylist(hlsPath, uploadDir)
+            // Verify segments
+            await verifySegments(uploadDir, hlsPath, statusPath)
+            resolve(true)
+          })
+          .on('error', (err) => {
+            console.error(`[TURBO] Failed:`, err.message)
+            resolve(false)
+          })
+          .run()
+      })
+    }
+
+    const runSafeConversion = async (): Promise<boolean> => {
+      console.log(`[SAFE] Starting chunked conversion for ${slug}`)
 
       try {
-        // 1. Split into 5-min chunks (Instant Copy) - Only video and audio, subs handled separately
+        await writeFile(statusPath, JSON.stringify({ status: 'processing', progress: 0, mode: 'safe' }))
+
+        // Split into 5-min chunks
         const segmentPattern = path.join(uploadDir, 'chunk_%03d.mp4')
         await new Promise<void>((resolve, reject) => {
           ffmpeg(inputPath)
             .outputOptions([
-              '-map 0:v:0',           // First video stream
-              '-map 0:a',             // All audio streams
-              '-c copy',              // Copy codec (fast)
-              '-segment_time 300',    // 5 minute chunks
+              '-map 0:v:0',
+              '-map 0:a?',
+              '-c copy',
+              '-segment_time 300',
               '-f segment',
               '-reset_timestamps 1'
             ])
             .output(segmentPattern)
-            .on('start', (cmd) => console.log(`Segmenting: ${cmd}`))
             .on('end', () => resolve())
             .on('error', (err) => reject(err))
             .run()
         })
 
-        // 2. Process each chunk
-        // We need to find how many chunks were created
-        const chunks = (await readdir(uploadDir)).filter(f => f.startsWith('chunk_') && f.endsWith('.mp4')).sort()
+        // Find chunks
+        const chunks = (await readdir(uploadDir))
+          .filter(f => f.startsWith('chunk_') && f.endsWith('.mp4'))
+          .sort()
 
-        let totalChunks = chunks.length
-        console.log(`Split into ${totalChunks} chunks. Processing...`)
+        const totalChunks = chunks.length
+        console.log(`[SAFE] Split into ${totalChunks} chunks`)
 
+        // Process each chunk
         for (let i = 0; i < totalChunks; i++) {
-          const chunkName = chunks[i]
-          const chunkInput = path.join(uploadDir, chunkName)
+          const chunkInput = path.join(uploadDir, chunks[i])
           const chunkHls = path.join(uploadDir, `out_${i}.m3u8`)
 
-          // Update Status
-          const overallProgress = Math.round((i / totalChunks) * 100)
-          await writeFile(statusPath, JSON.stringify({ status: 'processing', progress: overallProgress, mode: `${mode} (chunk ${i + 1}/${totalChunks})` }))
+          const progress = Math.round((i / totalChunks) * 100)
+          await writeFile(statusPath, JSON.stringify({
+            status: 'processing', progress, mode: `safe (chunk ${i + 1}/${totalChunks})`
+          }))
 
-          // Cool down
-          await sleep(1000)
+          // Cool down between chunks to prevent OOM
+          await sleep(2000)
 
-          // Convert Chunk
           await new Promise<void>((resolve, reject) => {
-            // Define options based on mode
-            let outputOptions: string[] = []
-
-            if (mode === 'semi-turbo') {
-              // COPY Video, Encode ALL Audio to AAC for HLS compatibility
-              outputOptions = [
-                '-map 0:v:0',         // First video stream
-                '-map 0:a',           // All audio streams  
-                '-c:v copy',          // Copy video
-                '-c:a aac',           // Convert audio to AAC
-                '-hls_time 6',
-                '-hls_playlist_type vod',
-                '-hls_segment_filename', path.join(uploadDir, `file_${i}_%03d.ts`)
-              ]
-            } else {
-              // SAFE: Re-encode Everything
-              outputOptions = [
-                '-map 0:v:0',         // First video stream
-                '-map 0:a',           // All audio streams
+            ffmpeg(chunkInput)
+              .outputOptions([
+                '-map 0:v:0',
+                '-map 0:a?',
                 '-threads 1',
                 '-preset ultrafast',
-                '-codec:v h264',
-                '-codec:a aac',
-                '-hls_time 6',
+                '-c:v libx264',
+                '-c:a aac',
+                '-ac 2',
+                '-hls_time 10',
                 '-hls_playlist_type vod',
-                '-hls_segment_filename', path.join(uploadDir, `file_${i}_%03d.ts`)
-              ]
-            }
-
-            ffmpeg(chunkInput)
-              .outputOptions(outputOptions)
+                '-hls_segment_filename', path.join(uploadDir, `seg_${i}_%03d.ts`)
+              ])
               .output(chunkHls)
-              .on('start', (cmd) => console.log(`Chunk ${i} conversion: ${cmd}`))
+              .on('start', (cmd) => console.log(`[SAFE] Chunk ${i}: ${cmd}`))
               .on('end', () => resolve())
-              .on('error', (err) => {
-                console.error(`Chunk ${i} error:`, err.message)
-                reject(err)
-              })
+              .on('error', (err) => reject(err))
               .run()
           })
 
-          // Delete the intermediate chunk MP4
+          // Delete intermediate chunk
           await unlink(chunkInput).catch(() => { })
         }
 
+        // Merge playlists properly
+        await mergeChunkPlaylists(uploadDir, hlsPath, totalChunks)
 
-        // 3. Merge Playlists
-        let masterPlaylist = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:7\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
-
-        for (let i = 0; i < totalChunks; i++) {
-          const chunkContent = await readFile(path.join(uploadDir, `out_${i}.m3u8`), 'utf-8')
-          const lines = chunkContent.split('\n')
-          lines.forEach(line => {
-            if (line.startsWith('#EXTINF')) {
-              masterPlaylist += line + "\n"
-            } else if (line.endsWith('.ts')) {
-              // Fix: Remove absolute path prefix
-              const relativeLine = line.replace(uploadDir + path.sep, '').replace(uploadDir + '/', '')
-              masterPlaylist += relativeLine + "\n"
-            }
-            if (line.startsWith('#EXT-X-DISCONTINUITY')) {
-              masterPlaylist += line + "\n"
-            }
-          })
-          masterPlaylist += "#EXT-X-DISCONTINUITY\n"
-          await unlink(path.join(uploadDir, `out_${i}.m3u8`)).catch(() => { })
-        }
-
-        masterPlaylist += "#EXT-X-ENDLIST"
-        await writeFile(hlsPath, masterPlaylist)
-
-        console.log(`Chunked conversion complete for ${slug}`)
-        await writeFile(statusPath, JSON.stringify({ status: 'ready', progress: 100, mode })).catch(() => { })
-        await unlink(lockFile).catch(() => { })
+        // Verify
+        await verifySegments(uploadDir, hlsPath, statusPath)
+        return true
 
       } catch (e) {
-        console.error(`Chunked ${mode} failed`, e)
-        if (mode === 'semi-turbo') {
-          await runChunkedConversion('safe')
-        } else {
-          await writeFile(statusPath, JSON.stringify({ status: 'error', error: 'Conversion failed' })).catch(() => { })
-          await unlink(lockFile).catch(() => { })
+        console.error(`[SAFE] Failed:`, e)
+        await writeFile(statusPath, JSON.stringify({ status: 'error', error: 'Conversion failed' })).catch(() => { })
+        await unlink(lockFile).catch(() => { })
+        return false
+      }
+    }
+
+    // Schedule conversion with delay (let Next.js finish compiling first)
+    console.log(`Scheduling conversion for ${slug} in 8 seconds...`)
+    setTimeout(async () => {
+      try {
+        const turboOk = await runTurboConversion()
+        if (!turboOk) {
+          console.log(`Turbo failed, falling back to safe mode...`)
+          await writeFile(statusPath, JSON.stringify({
+            status: 'processing', progress: 0, mode: 'safe (fallback)'
+          })).catch(() => { })
+          await runSafeConversion()
         }
+      } catch (e) {
+        console.error('Conversion error:', e)
+        await writeFile(statusPath, JSON.stringify({ status: 'error', error: 'Conversion crashed' })).catch(() => { })
+      } finally {
+        await unlink(lockFile).catch(() => { })
       }
-    }
-
-    console.log(`Checking file streams for ${slug}...`)
-
-    // Probe file
-    let audioStreams: any[] = []
-    try {
-      const ffprobe = promisify(ffmpeg.ffprobe)
-      const metadata = await ffprobe(inputPath) as any
-      audioStreams = metadata.streams.filter((s: any) => s.codec_type === 'audio')
-      console.log(`Found ${audioStreams.length} audio streams for ${slug}`)
-    } catch (e) {
-      console.error('Probe failed:', e)
-      // Fallback to basic assumption
-    }
-
-    const runConversion = (mode: 'turbo' | 'semi-turbo' | 'safe') => {
-      console.log(`Attempting conversion in ${mode} mode for ${slug}`)
-
-      if (mode !== 'turbo') {
-        runChunkedConversion(mode)
-        return
-      }
-
-      // Turbo Logic - Simple stream copy with audio re-encoding for HLS compatibility
-      const outputOptions = [
-        '-map 0:v:0',      // Map first video stream
-        '-map 0:a',        // Map ALL audio streams
-        '-c:v copy',       // Copy video
-        '-c:a aac',        // AAC Audio
-        '-hls_time 6',
-        '-hls_playlist_type vod',
-        '-hls_list_size 0',
-      ]
-
-      // Dynamic Stream Mapping for Multi-Audio
-      if (audioStreams.length > 0) {
-        // Build var_stream_map
-        // Format: "v:0,agroup:audio a:0,agroup:audio,language:eng ... "
-
-        // Video maps to first video stream and uses audio group 'audio-group'
-        let streamMap = "v:0,agroup:audio-group"
-        let hasLang = false
-
-        audioStreams.forEach((stream, index) => {
-          // Determine language
-          const lang = stream.tags?.language || stream.tags?.TIT2 || `unk${index}`
-          // const name = stream.tags?.title || stream.tags?.handler_name || `Audio ${index + 1}`
-
-          // Add to map
-          streamMap += ` a:${index},agroup:audio-group`
-
-          if (stream.tags?.language) {
-            streamMap += `,language:${stream.tags.language}`
-            hasLang = true
-          } else {
-            // Try to guess or just leave optional
-            streamMap += `,language:${index}` // default unique
-          }
-        })
-
-        outputOptions.push(`-var_stream_map`, streamMap)
-
-        // Critical: When using var_stream_map, HLS master playlist generation behavior changes.
-        // We need to specify master playlist name if likely not automatic, but here the output IS the master.
-        // But we need to define segment filename patterns that account for variants.
-        outputOptions.push(`-master_pl_name`, `movie.m3u8`) // actually we might need to output to valid variants
-
-        // When using var_stream_map, the direct output argument should be a pattern for the variant playlists
-        // e.g. "path/to/stream_%v.m3u8"
-        // And master_pl_name creates the master.
-      } else {
-        outputOptions.push('-hls_segment_filename', path.join(uploadDir, 'segment_%03d.ts'))
-      }
-
-      console.log("Derived Options:", outputOptions)
-
-      const command = ffmpeg(inputPath)
-        .outputOptions(outputOptions)
-
-      if (audioStreams.length > 0) {
-        // For var_stream_map, output is the pattern for Media Playlists
-        command.output(path.join(uploadDir, 'stream_%v.m3u8'))
-        // The master playlist is generated due to -master_pl_name
-
-        // WE ALSO Need unique segment names for each stream
-        command.outputOption('-hls_segment_filename', path.join(uploadDir, 'segment_%v_%03d.ts'))
-      } else {
-        // Fallback single file
-        command.output(hlsPath) // movie.m3u8
-      }
-
-      command
-        .on('start', (cmd) => {
-          console.log(`FFmpeg command: ${cmd}`)
-        })
-        .on('progress', (progress) => {
-          if (progress.percent) {
-            const percent = Math.round(progress.percent)
-            writeFile(statusPath, JSON.stringify({ status: 'processing', progress: percent, mode })).catch(() => { })
-          }
-        })
-        .on('end', async () => {
-          console.log(`FFmpeg HLS finished for ${slug} in ${mode} mode`)
-
-          // Sanitize Playlists (Remove Absolute Paths)
-          try {
-            const processPlaylist = async (filePath: string) => {
-              try {
-                let content = await readFile(filePath, 'utf-8')
-
-                // Debug: Log first few lines before fix
-                console.log(`[FixPaths] Processing ${path.basename(filePath)}. Preview before:`, content.split('\n').slice(0, 5))
-
-                // Robust Replace: Create regex to match uploadDir with either slash
-                // uploadDir is absolute path. We want to remove it + optional trailing slash
-                // Escape special regex chars in uploadDir
-                const escapedDir = uploadDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-                const regex = new RegExp(escapedDir + '[\\\\/]*', 'g')
-
-                content = content.replace(regex, '')
-
-                // Also ensure no double slashes at start of lines (if any remain)
-                // content = content.replace(/^[\/\\]+/gm, '') 
-
-                await writeFile(filePath, content)
-                console.log(`[FixPaths] Fixed ${path.basename(filePath)}.`)
-              } catch (e) {
-                console.warn(`[FixPaths] Could not read/write ${filePath}`, e)
-              }
-            }
-
-            // Clean master playlist
-            await processPlaylist(hlsPath)
-
-            // Clean variant playlists if they exist
-            // For var_stream_map, we expect stream_0.m3u8, stream_1.m3u8 etc.
-            // We can just list dir and find .m3u8 files
-            try {
-              const files = await readdir(uploadDir)
-              const m3u8Files = files.filter(f => f.endsWith('.m3u8') && f !== 'movie.m3u8')
-              console.log(`[FixPaths] Found variants: ${m3u8Files.join(', ')}`)
-
-              for (const f of m3u8Files) {
-                await processPlaylist(path.join(uploadDir, f))
-              }
-            } catch (err) {
-              console.error("[FixPaths] Error finding variants:", err)
-            }
-
-            console.log(`Playlists sanitized for ${slug}`)
-          } catch (e) {
-            console.error('Error sanitizing playlists:', e)
-          }
-
-          writeFile(statusPath, JSON.stringify({ status: 'ready', progress: 100, mode })).catch(() => { })
-          unlink(lockFile).catch(() => console.error('Failed to clear lock'))
-        })
-        .on('error', (err) => {
-          console.error(`FFmpeg error in ${mode} mode for ${slug}:`, err.message)
-
-          if (mode === 'turbo') {
-            console.log(`Turbo mode failed, switching to Semi-Turbo (Chunked) mode for ${slug}...`)
-            writeFile(statusPath, JSON.stringify({ status: 'processing', progress: 0, mode: 'semi-turbo' })).catch(() => { })
-            // Switch to CHUNKED for safety
-            runChunkedConversion('semi-turbo')
-          }
-        })
-        .run()
-    }
-
-    // Start with Turbo mode
-    // CRITICAL: We MUST delay initialization to allow Next.js to compile the status page.
-    // If we start immediately, Next.js Compiler + FFmpeg = OOM Crash on Termux.
-    console.log(`Scheduling conversion for ${slug} in 10 seconds...`)
-    setTimeout(() => {
-      runConversion('turbo')
-    }, 10000) // 10s delay
+    }, 8000)
 
     return NextResponse.json({ success: true, slug, message: 'Upload received. Conversion scheduled.' })
 
   } catch (error) {
     console.error('Upload error:', error)
-    // Try to clear lock if generic error
-    await unlink(path.resolve('./processing.lock')).catch(() => { })
+    await unlink(lockFile).catch(() => { })
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 })
+  }
+}
+
+// ====== HELPER FUNCTIONS ======
+
+async function sanitizePlaylist(m3u8Path: string, uploadDir: string) {
+  try {
+    let content = await readFile(m3u8Path, 'utf-8')
+    // Remove any absolute path prefixes from segment filenames
+    const escapedDir = uploadDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const regex = new RegExp(escapedDir + '[\\\\/]*', 'g')
+    content = content.replace(regex, '')
+    await writeFile(m3u8Path, content)
+    console.log(`[SANITIZE] Cleaned ${path.basename(m3u8Path)}`)
+  } catch (e) {
+    console.error('[SANITIZE] Error:', e)
+  }
+}
+
+async function mergeChunkPlaylists(uploadDir: string, outputPath: string, totalChunks: number) {
+  // Parse each chunk playlist and build a proper combined one
+  let maxDuration = 0
+  const segmentEntries: string[] = []
+
+  for (let i = 0; i < totalChunks; i++) {
+    const chunkPath = path.join(uploadDir, `out_${i}.m3u8`)
+    try {
+      const content = await readFile(chunkPath, 'utf-8')
+      const lines = content.split('\n')
+
+      // Extract target duration from chunk
+      for (const line of lines) {
+        const tdMatch = line.match(/#EXT-X-TARGETDURATION:(\d+)/)
+        if (tdMatch) {
+          maxDuration = Math.max(maxDuration, parseInt(tdMatch[1]))
+        }
+      }
+
+      // Collect segment entries
+      for (let j = 0; j < lines.length; j++) {
+        const line = lines[j].trim()
+        if (line.startsWith('#EXTINF')) {
+          const nextLine = (lines[j + 1] || '').trim()
+          if (nextLine && !nextLine.startsWith('#')) {
+            // Remove absolute path if present
+            const relativeName = nextLine
+              .replace(uploadDir + path.sep, '')
+              .replace(uploadDir + '/', '')
+            segmentEntries.push(line)
+            segmentEntries.push(relativeName)
+          }
+        }
+      }
+
+      // Add discontinuity marker between chunks (not after last)
+      if (i < totalChunks - 1) {
+        segmentEntries.push('#EXT-X-DISCONTINUITY')
+      }
+
+      // Clean up chunk playlist
+      await unlink(chunkPath).catch(() => { })
+    } catch (e) {
+      console.error(`[MERGE] Error reading chunk ${i}:`, e)
+    }
+  }
+
+  if (maxDuration === 0) maxDuration = 11 // fallback
+
+  // Build final playlist
+  const playlist = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:3',
+    `#EXT-X-TARGETDURATION:${maxDuration}`,
+    '#EXT-X-MEDIA-SEQUENCE:0',
+    '#EXT-X-PLAYLIST-TYPE:VOD',
+    ...segmentEntries,
+    '#EXT-X-ENDLIST'
+  ].join('\n')
+
+  await writeFile(outputPath, playlist)
+  console.log(`[MERGE] Created merged playlist with ${segmentEntries.filter(e => e.endsWith('.ts')).length} segments`)
+}
+
+async function verifySegments(uploadDir: string, m3u8Path: string, statusPath: string) {
+  try {
+    const content = await readFile(m3u8Path, 'utf-8')
+    const lines = content.split('\n')
+    let valid = 0
+    let invalid = 0
+
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (trimmed.endsWith('.ts') && !trimmed.startsWith('#')) {
+        const segPath = path.join(uploadDir, trimmed)
+        try {
+          const s = await stat(segPath)
+          if (s.size > 0) valid++
+          else invalid++
+        } catch {
+          invalid++
+        }
+      }
+    }
+
+    console.log(`[VERIFY] ${valid} valid segments, ${invalid} invalid`)
+
+    if (invalid > 0) {
+      await writeFile(statusPath, JSON.stringify({
+        status: 'error',
+        error: `${invalid} segments are missing or empty`,
+        validSegments: valid,
+        invalidSegments: invalid
+      }))
+    } else {
+      await writeFile(statusPath, JSON.stringify({
+        status: 'ready',
+        progress: 100,
+        segments: valid,
+        verified: true
+      }))
+    }
+  } catch (e) {
+    console.error('[VERIFY] Error:', e)
+    await writeFile(statusPath, JSON.stringify({ status: 'ready', progress: 100 }))
   }
 }

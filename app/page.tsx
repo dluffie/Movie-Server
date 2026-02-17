@@ -13,14 +13,8 @@ type Movie = {
 export default function Home() {
   const [movies, setMovies] = useState<Movie[]>([])
   const [search, setSearch] = useState('')
-  const [streamHost, setStreamHost] = useState('')
 
   useEffect(() => {
-    // Determine the streaming host (same as current host but port 8080)
-    if (typeof window !== 'undefined') {
-      setStreamHost(`http://${window.location.hostname}:8080`)
-    }
-
     fetch('/api/movies')
       .then(res => res.json())
       .then(data => setMovies(data.movies))
@@ -57,13 +51,11 @@ export default function Home() {
           {filteredMovies.map((movie) => (
             <Link key={movie.slug} href={`/movie/${movie.slug}`} className="group relative block bg-gray-900 rounded-lg overflow-hidden transition transform hover:scale-105 hover:z-10 shadow-lg">
               <div className="aspect-[2/3] bg-gray-800 relative">
-                {/* We try to load the poster from Nginx */}
                 <img
-                  src={`${streamHost}/hls/${movie.slug}/poster.jpg`}
+                  src={`/api/stream/${movie.slug}/poster.jpg`}
                   alt={movie.title}
                   className="w-full h-full object-cover opacity-90 group-hover:opacity-100 transition"
                   onError={(e) => {
-                    // Fallback if poster missing
                     (e.target as HTMLImageElement).src = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjNDQ0IiBzdHJva2Utd2lkdGg9IjIiPjxyZWN0IHg9IjMiIHk9IjMiIHdpZHRoPSIxOCIgaGVpZ2h0PSIxOCIgcng9IjIiIHJ5PSIyIi8+PGNpcmNsZSBjeD0iOC41IiBjeT0iOC41IiByPSIxLjUiLz48cG9seWxpbmUgcG9pbnRzPSIyMSAxNSAxNiAxMCA1IDIxIi8+PC9zdmc+'
                   }}
                 />

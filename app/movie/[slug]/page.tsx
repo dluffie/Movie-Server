@@ -5,109 +5,191 @@ import { useParams } from 'next/navigation'
 import Hls from 'hls.js'
 import Link from 'next/link'
 
+type VerifyResult = {
+    valid: boolean
+    status: string
+    error?: string
+    totalSegments?: number
+    validSegments?: number
+    invalidSegments?: string[]
+    totalSizeMB?: number
+}
+
+type ProcessingStatus = {
+    status: 'processing' | 'ready' | 'error' | 'not-found'
+    progress?: number
+    mode?: string
+    error?: string
+    verified?: boolean
+}
+
 export default function PlayerPage() {
     const { slug } = useParams()
     const videoRef = useRef<HTMLVideoElement>(null)
+    const [playerStatus, setPlayerStatus] = useState<'checking' | 'loading' | 'playing' | 'error'>('checking')
+    const [statusText, setStatusText] = useState('Checking stream...')
     const [error, setError] = useState('')
-    const [status, setStatus] = useState<'loading' | 'playing' | 'error'>('loading')
-    const retryTimeout = useRef<NodeJS.Timeout | null>(null)
     const [audioTracks, setAudioTracks] = useState<any[]>([])
-    const [subtitleTracks, setSubtitleTracks] = useState<any[]>([])
     const [currentAudio, setCurrentAudio] = useState(-1)
-    const [currentSubtitle, setCurrentSubtitle] = useState(-1)
+    const [verifyInfo, setVerifyInfo] = useState<VerifyResult | null>(null)
     const hlsRef = useRef<Hls | null>(null)
+    const retryTimeout = useRef<NodeJS.Timeout | null>(null)
+    const pollTimeout = useRef<NodeJS.Timeout | null>(null)
 
+    // Step 1: Check if stream is ready before trying to play
+    const checkStreamReady = async (): Promise<boolean> => {
+        try {
+            // First check processing status
+            const statusRes = await fetch(`/api/movie/${slug}/status`)
+            const statusData: ProcessingStatus = await statusRes.json()
+
+            if (statusData.status === 'processing') {
+                setPlayerStatus('loading')
+                setStatusText(`Converting: ${statusData.progress || 0}% (${statusData.mode || 'processing'})`)
+                return false
+            }
+
+            if (statusData.status === 'error') {
+                setPlayerStatus('error')
+                setError(statusData.error || 'Conversion failed')
+                return false
+            }
+
+            if (statusData.status === 'not-found') {
+                setPlayerStatus('loading')
+                setStatusText('Waiting for processing to start...')
+                return false
+            }
+
+            // Stream is "ready" — now verify integrity
+            try {
+                const verifyRes = await fetch(`/api/movie/${slug}/verify`)
+                const verifyData: VerifyResult = await verifyRes.json()
+                setVerifyInfo(verifyData)
+
+                if (!verifyData.valid) {
+                    if (verifyData.status === 'incomplete') {
+                        setPlayerStatus('loading')
+                        setStatusText('Stream still being written...')
+                        return false
+                    }
+                    // Show warning but still try to play
+                    console.warn('Stream verification issues:', verifyData)
+                }
+            } catch {
+                // Verify endpoint failed — not critical, still try to play
+                console.warn('Could not verify stream, attempting playback anyway')
+            }
+
+            return true
+        } catch {
+            setPlayerStatus('loading')
+            setStatusText('Checking stream status...')
+            return false
+        }
+    }
+
+    // Step 2: Initialize HLS player
     const initPlayer = () => {
         if (!slug) return
 
         const video = videoRef.current
         if (!video) return
 
-        const host = window.location.hostname
-        // Use movie.m3u8 as primary (created by chunked conversion)
-        const src = `http://${host}:8080/hls/${slug}/movie.m3u8`
+        // Use self-served streams (no Nginx needed!)
+        const src = `/api/stream/${slug}/movie.m3u8`
 
         if (Hls.isSupported()) {
-            const hls = new Hls({ debug: false })
+            const hls = new Hls({
+                debug: false,
+                // Optimized for low RAM (2GB device)
+                maxBufferLength: 15,           // Max 15s forward buffer
+                maxMaxBufferLength: 30,        // Absolute max 30s
+                maxBufferSize: 10 * 1024 * 1024, // 10MB max buffer
+                maxBufferHole: 0.5,
+                startFragPrefetch: false,      // Don't prefetch
+                enableWorker: false,           // Save memory — no web worker
+            })
             hlsRef.current = hls
 
-            // Try master playlist first
             hls.loadSource(src)
             hls.attachMedia(video)
 
-            hls.on(Hls.Events.MANIFEST_PARSED, (e, data) => {
+            hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
                 console.log('HLS Manifest Parsed:', {
                     levels: data.levels?.length,
                     audioTracks: data.audioTracks?.length,
-                    subtitleTracks: data.subtitleTracks?.length
                 })
 
-                // Initialize tracks immediately from manifest
                 if (data.audioTracks && data.audioTracks.length > 0) {
                     setAudioTracks(data.audioTracks)
                     setCurrentAudio(hls.audioTrack)
                 }
 
-                if (data.subtitleTracks && data.subtitleTracks.length > 0) {
-                    setSubtitleTracks(data.subtitleTracks)
-                    setCurrentSubtitle(hls.subtitleTrack)
-                }
-
-                setStatus('playing')
-                video.play().catch(e => console.log('Autoplay blocked', e))
-                setError('')
+                setPlayerStatus('playing')
+                setStatusText('')
+                video.play().catch(e => console.log('Autoplay blocked:', e.message))
             })
 
-            hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (e, data) => {
-                console.log('Audio Tracks Updated:', data.audioTracks)
+            hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, (_e, data) => {
                 setAudioTracks(data.audioTracks)
                 setCurrentAudio(hls.audioTrack)
             })
 
-            hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, (e, data) => {
-                console.log('Subtitle Tracks Updated:', data.subtitleTracks)
-                setSubtitleTracks(data.subtitleTracks)
-                setCurrentSubtitle(hls.subtitleTrack)
-            })
-
-            hls.on(Hls.Events.ERROR, (event, data) => {
+            hls.on(Hls.Events.ERROR, (_event, data) => {
                 if (data.fatal) {
                     switch (data.type) {
                         case Hls.ErrorTypes.NETWORK_ERROR:
-                            console.log('Network error, retrying in 5s...')
-                            setStatus('loading')
+                            console.log('HLS network error, retrying in 3s...')
+                            setPlayerStatus('loading')
+                            setStatusText('Network error, retrying...')
                             hls.destroy()
-                            retryTimeout.current = setTimeout(initPlayer, 5000)
+                            hlsRef.current = null
+                            retryTimeout.current = setTimeout(() => startPlayback(), 3000)
                             break
                         case Hls.ErrorTypes.MEDIA_ERROR:
-                            console.log('Media error, trying verification...')
+                            console.log('HLS media error, attempting recovery...')
                             hls.recoverMediaError()
                             break
                         default:
-                            setStatus('error')
+                            setPlayerStatus('error')
                             setError(`Stream error: ${data.details}`)
                             hls.destroy()
+                            hlsRef.current = null
                             break
                     }
                 }
             })
+
             return hls
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-            // Native HLS support (Safari/iOS) - Controls are native
+            // Native HLS (Safari/iOS)
             video.src = src
             video.addEventListener('loadedmetadata', () => {
-                setStatus('playing')
+                setPlayerStatus('playing')
                 video.play()
             })
             video.addEventListener('error', () => {
-                setStatus('loading')
-                retryTimeout.current = setTimeout(initPlayer, 5000)
+                setPlayerStatus('loading')
+                setStatusText('Retrying...')
+                retryTimeout.current = setTimeout(() => startPlayback(), 3000)
             })
             return null
         } else {
-            setStatus('error')
+            setPlayerStatus('error')
             setError('HLS not supported in this browser.')
             return null
+        }
+    }
+
+    // Main flow: check → play (with polling if not ready)
+    const startPlayback = async () => {
+        const ready = await checkStreamReady()
+        if (ready) {
+            initPlayer()
+        } else {
+            // Poll every 5 seconds
+            pollTimeout.current = setTimeout(() => startPlayback(), 5000)
         }
     }
 
@@ -118,40 +200,28 @@ export default function PlayerPage() {
         }
     }
 
-    const changeSubtitle = (trackId: number) => {
-        if (hlsRef.current) {
-            hlsRef.current.subtitleTrack = trackId
-            setCurrentSubtitle(trackId)
-        }
-    }
-
     useEffect(() => {
-        const hlsInstance = initPlayer()
+        startPlayback()
 
         return () => {
-            if (hlsInstance) hlsInstance.destroy()
+            if (hlsRef.current) hlsRef.current.destroy()
             if (retryTimeout.current) clearTimeout(retryTimeout.current)
+            if (pollTimeout.current) clearTimeout(pollTimeout.current)
         }
     }, [slug])
 
     const handleDelete = async () => {
-        if (!confirm('Are you sure you want to delete this movie permanently? This cannot be undone.')) return
-
+        if (!confirm('Delete this movie permanently?')) return
         try {
             const res = await fetch(`/api/movie/${slug}`, { method: 'DELETE' })
-            if (res.ok) {
-                window.location.href = '/'
-            } else {
-                alert('Failed to delete movie.')
-            }
-        } catch (e) {
-            alert('Error deleting movie')
-        }
+            if (res.ok) window.location.href = '/'
+            else alert('Failed to delete.')
+        } catch { alert('Error deleting movie') }
     }
 
     return (
         <div className="min-h-screen bg-black flex flex-col items-center justify-center relative">
-            <div className="absolute top-6 left-6 z-10 flex gap-4">
+            <div className="absolute top-6 left-6 z-10">
                 <Link href="/" className="text-white bg-gray-800 px-4 py-2 rounded hover:bg-gray-700">
                     ← Back to Home
                 </Link>
@@ -167,30 +237,46 @@ export default function PlayerPage() {
             </div>
 
             <div className="w-full max-w-6xl flex flex-col gap-4">
+                {/* Video Player */}
                 <div className="w-full aspect-video bg-black relative shadow-2xl flex items-center justify-center">
                     <video
                         ref={videoRef}
                         controls
-                        className={`w-full h-full ${status === 'playing' ? 'block' : 'hidden'}`}
-                        poster={`http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:8080/hls/${slug}/poster.jpg`}
+                        playsInline
+                        className={`w-full h-full ${playerStatus === 'playing' ? 'block' : 'hidden'}`}
+                        poster={`/api/stream/${slug}/poster.jpg`}
                     />
 
-                    {status === 'loading' && (
-                        <div className="text-center absolute inset-0 flex flex-col items-center justify-center bg-black/50 z-20">
-                            <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-red-600 mx-auto mb-4"></div>
-                            <p className="text-white text-xl">Processing Video... Please wait.</p>
+                    {playerStatus === 'checking' && (
+                        <div className="text-center absolute inset-0 flex flex-col items-center justify-center bg-black z-20">
+                            <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500 mb-4"></div>
+                            <p className="text-white text-lg">Checking stream...</p>
                         </div>
                     )}
 
-                    {status === 'error' && (
-                        <div className="text-red-500 text-center p-4 bg-black/80 rounded absolute z-20">
-                            <p className="text-xl font-bold mb-2">Error Playing Video</p>
+                    {playerStatus === 'loading' && (
+                        <div className="text-center absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-20">
+                            <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-red-600 mb-4"></div>
+                            <p className="text-white text-xl">{statusText}</p>
+                            <p className="text-gray-400 text-sm mt-2">Auto-refreshing every 5 seconds...</p>
+                        </div>
+                    )}
+
+                    {playerStatus === 'error' && (
+                        <div className="text-red-500 text-center p-6 bg-black/90 rounded absolute z-20">
+                            <p className="text-xl font-bold mb-2">Error</p>
                             <p>{error}</p>
+                            <button
+                                onClick={() => { setPlayerStatus('checking'); startPlayback() }}
+                                className="mt-4 px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700"
+                            >
+                                Retry
+                            </button>
                         </div>
                     )}
                 </div>
 
-                {/* Track Controls */}
+                {/* Audio Track Controls */}
                 <div className="flex flex-wrap gap-4 px-4 py-2 bg-gray-900 rounded-lg">
                     {audioTracks.length > 1 && (
                         <div className="flex items-center gap-2">
@@ -202,28 +288,23 @@ export default function PlayerPage() {
                             >
                                 {audioTracks.map((track, i) => (
                                     <option key={i} value={i}>
-                                        {track.name || track.lang || `Track ${i + 1}`}
+                                        {track.name || track.lang || `Audio ${i + 1}`}
                                     </option>
                                 ))}
                             </select>
                         </div>
                     )}
 
-                    {subtitleTracks.length > 0 && (
-                        <div className="flex items-center gap-2">
-                            <span className="text-gray-400 font-bold">Subtitles:</span>
-                            <select
-                                value={currentSubtitle}
-                                onChange={(e) => changeSubtitle(parseInt(e.target.value))}
-                                className="bg-gray-800 text-white p-2 rounded border border-gray-700"
-                            >
-                                <option value={-1}>Off</option>
-                                {subtitleTracks.map((track, i) => (
-                                    <option key={i} value={i}>
-                                        {track.name || track.lang || `Subtitle ${i + 1}`}
-                                    </option>
-                                ))}
-                            </select>
+                    {/* Integrity Badge */}
+                    {verifyInfo && (
+                        <div className="flex items-center gap-2 ml-auto">
+                            <span className={`text-xs px-2 py-1 rounded ${verifyInfo.valid ? 'bg-green-900 text-green-300' : 'bg-yellow-900 text-yellow-300'
+                                }`}>
+                                {verifyInfo.valid
+                                    ? `✓ Verified (${verifyInfo.totalSegments} segments, ${verifyInfo.totalSizeMB}MB)`
+                                    : `⚠ ${verifyInfo.error || 'Issues detected'}`
+                                }
+                            </span>
                         </div>
                     )}
                 </div>
