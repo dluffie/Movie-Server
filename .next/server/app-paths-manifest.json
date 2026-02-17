@@ -3,12 +3,13 @@
   "/api/movie/[slug]/route": "app/api/movie/[slug]/route.js",
   "/api/movies/route": "app/api/movies/route.js",
   "/favicon.ico/route": "app/favicon.ico/route.js",
+  "/api/movie/[slug]/status/route": "app/api/movie/[slug]/status/route.js",
+  "/api/movie/[slug]/reconvert/route": "app/api/movie/[slug]/reconvert/route.js",
+  "/api/upload/poster/route": "app/api/upload/poster/route.js",
   "/api/stream/[...path]/route": "app/api/stream/[...path]/route.js",
   "/api/movie/[slug]/verify/route": "app/api/movie/[slug]/verify/route.js",
-  "/api/movie/[slug]/status/route": "app/api/movie/[slug]/status/route.js",
-  "/api/upload/poster/route": "app/api/upload/poster/route.js",
   "/api/upload/route": "app/api/upload/route.js",
   "/page": "app/page.js",
-  "/movie/[slug]/page": "app/movie/[slug]/page.js",
-  "/upload/page": "app/upload/page.js"
+  "/upload/page": "app/upload/page.js",
+  "/movie/[slug]/page": "app/movie/[slug]/page.js"
 }
