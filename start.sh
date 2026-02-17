@@ -6,31 +6,53 @@
 
 echo "🎬 LOCFLIX - Starting Local Movie Server..."
 
-# Limit Node.js memory to 256MB (safe for 2GB RAM)
+# Limit Node.js memory
 export NODE_OPTIONS="--max-old-space-size=256"
 
 # Create movies directory if needed
 mkdir -p ./movies
 
-# Check if build exists
-if [ ! -d ".next" ]; then
-    echo "📦 First run — building production bundle..."
-    echo "  (This takes 2-3 minutes, but uses less RAM afterwards)"
-    npx next build
-    
-    if [ $? -ne 0 ]; then
-        echo "❌ Build failed! Try: npm run dev (uses more RAM)"
-        exit 1
-    fi
+# Check for a VALID production build (BUILD_ID must exist)
+if [ ! -f ".next/BUILD_ID" ]; then
+    echo ""
+    echo "⚠️  No valid production build found!"
+    echo ""
+    echo "   Your phone doesn't have enough RAM to build."
+    echo "   Build on your PC first, then push to Termux:"
+    echo ""
+    echo "   On PC:"
+    echo "     cd Movie-Server"
+    echo "     npm run build"
+    echo "     git add -A && git commit -m 'build' && git push"
+    echo ""
+    echo "   On Termux:"
+    echo "     cd ~/Movie-Server && git pull"
+    echo "     bash start.sh"
+    echo ""
+    echo "   Alternatively, try building here (may crash on 2GB RAM):"
+    echo "     NODE_OPTIONS='--max-old-space-size=384' npx next build"
+    echo ""
+    exit 1
 fi
+
+# Get local IP
+LOCAL_IP=$(ip route get 1 2>/dev/null | awk '{print $NF;exit}' || hostname -I 2>/dev/null | awk '{print $1}' || echo "0.0.0.0")
 
 echo ""
 echo "✅ Starting production server..."
 echo "   Open: http://localhost:3000"
-echo "   Network: http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo '0.0.0.0'):3000"
+echo "   Network: http://${LOCAL_IP}:3000"
 echo ""
 echo "   No Nginx needed! Everything runs through Next.js."
 echo ""
 
-# Start production server (uses much less RAM than dev)
-npx next start --hostname 0.0.0.0 --port 3000
+# Start the standalone server (uses minimal RAM)
+if [ -f ".next/standalone/server.js" ]; then
+    # Standalone mode (best for Termux)
+    cp -r .next/static .next/standalone/.next/static 2>/dev/null
+    cp -r public .next/standalone/public 2>/dev/null
+    node .next/standalone/server.js
+else
+    # Regular production start
+    npx next start --hostname 0.0.0.0 --port 3000
+fi

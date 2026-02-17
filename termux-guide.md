@@ -2,42 +2,45 @@
 
 ## Prerequisites
 ```bash
-pkg install nodejs ffmpeg
+pkg install nodejs git
 ```
 
-## First Time Setup
+**FFmpeg is only needed if you upload movies directly on the phone.**
+```bash
+pkg install ffmpeg
+```
+
+## Setup on Termux
+```bash
+git clone <your-repo-url> ~/Movie-Server
+cd ~/Movie-Server
+npm install --production
+```
+
+## Starting the Server
+
 ```bash
 cd ~/Movie-Server
-npm install
-```
-
-## Starting the Server (RECOMMENDED)
-
-**Use production mode** — dev mode uses too much RAM and will crash on 2GB devices.
-
-```bash
-# Option 1: Use the startup script
 bash start.sh
-
-# Option 2: Manual build + start
-npm run build
-npm run start:prod
 ```
 
-This will:
-1. Build the production bundle (one-time, ~2-3 min)
-2. Start the server with 256MB memory limit
-3. Listen on `http://0.0.0.0:3000`
+This uses the **pre-built standalone server** (built on your PC) — it uses only ~80MB RAM.
 
-## ⚠️ DO NOT use `npm run dev` on low-RAM devices!
-The dev server runs webpack HMR which uses 500MB+ RAM and will cause OOM kills.
+## ⚠️ IMPORTANT: Build on your PC, not on Termux!
+
+Your phone (2GB RAM) cannot run `next build` — it will crash.
+
+**Workflow:**
+1. Make code changes on your **Windows PC**
+2. Run `npm run build` on your **PC**
+3. Commit and push: `git add -A && git commit -m "update" && git push`
+4. On Termux: `cd ~/Movie-Server && git pull && bash start.sh`
 
 ## No Nginx Required!
-All video streaming is now handled directly by Next.js.
-You do NOT need to set up Nginx anymore.
+All video streaming is handled directly by Next.js on port 3000.
 
 ## Usage
 1. Open `http://<phone-ip>:3000` on any device on the same WiFi
 2. Upload movies via the Upload page
 3. Wait for conversion to complete
-4. Play movies - stream integrity is verified automatically
+4. Play movies — stream integrity is verified automatically
