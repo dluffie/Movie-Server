@@ -13,11 +13,9 @@
 # testing
 /coverage
 
-# next.js (keep standalone build for Termux deployment)
-/.next/*
-!/.next/BUILD_ID
-!/.next/standalone/
-!/.next/static/
+# next.js build (INCLUDED in git so Termux can skip building)
+# Only ignore cache, keep the actual build output
+/.next/cache/
 
 # production
 /build
@@ -41,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# movies data (too large for git)
+/movies/
