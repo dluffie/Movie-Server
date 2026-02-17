@@ -174,11 +174,10 @@ export async function POST(req: NextRequest) {
           // Build var_stream_map string
           let varMap = 'v:0,agroup:audio'
           audioStreams.forEach((stream: any, i: number) => {
-            const lang = stream.tags?.language || `audio_${i}`
-            const name = stream.tags?.title || stream.tags?.handler_name || lang
-            // Clean name (remove spaces/special chars for HLS compatibility)
-            const cleanName = name.replace(/[^a-zA-Z0-9_-]/g, '_')
-            varMap += ` a:${i},agroup:audio,language:${lang},name:${cleanName}`
+            const lang = stream.tags?.language || `und${i}`
+            // Use language + index for unique naming (avoids duplicate handler_names)
+            const name = `${lang}_${i}`
+            varMap += ` a:${i},agroup:audio,language:${lang},name:${name}`
 
             // Set default: first track is default
             if (i === 0) {

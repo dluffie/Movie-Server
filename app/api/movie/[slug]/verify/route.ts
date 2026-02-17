@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { readFile, stat } from 'fs/promises'
+import { readFile, readdir, stat } from 'fs/promises'
 import path from 'path'
 
 export const dynamic = 'force-dynamic'
@@ -31,7 +31,6 @@ export async function GET(
             })
         }
 
-        // 2. Validate playlist syntax
         const lines = playlistContent.split('\n').map(l => l.trim()).filter(Boolean)
 
         if (!lines[0]?.includes('#EXTM3U')) {
@@ -42,7 +41,52 @@ export async function GET(
             })
         }
 
-        const hasEndList = lines.some(l => l.includes('#EXT-X-ENDLIST'))
+        // 2. Detect if this is a master playlist (has #EXT-X-STREAM-INF or #EXT-X-MEDIA)
+        const isMasterPlaylist = lines.some(l =>
+            l.includes('#EXT-X-STREAM-INF') || l.includes('#EXT-X-MEDIA')
+        )
+
+        // 3. Collect all variant playlists and segments
+        const allSegments: string[] = []
+        let hasEndList = false
+
+        if (isMasterPlaylist) {
+            // Master playlist: find variant playlists, check THOSE for ENDLIST
+            const variantPlaylists: string[] = []
+            for (const line of lines) {
+                if (line.endsWith('.m3u8') && !line.startsWith('#')) {
+                    variantPlaylists.push(line)
+                }
+            }
+
+            for (const variant of variantPlaylists) {
+                try {
+                    const variantContent = await readFile(path.join(movieDir, variant), 'utf-8')
+                    const variantLines = variantContent.split('\n').map(l => l.trim()).filter(Boolean)
+
+                    if (variantLines.some(l => l.includes('#EXT-X-ENDLIST'))) {
+                        hasEndList = true
+                    }
+
+                    for (const vl of variantLines) {
+                        if (vl.endsWith('.ts') && !vl.startsWith('#')) {
+                            allSegments.push(vl)
+                        }
+                    }
+                } catch (e) {
+                    console.error(`Verify: couldn't read variant ${variant}:`, e)
+                }
+            }
+        } else {
+            // Simple playlist: check directly
+            hasEndList = lines.some(l => l.includes('#EXT-X-ENDLIST'))
+            for (const line of lines) {
+                if (line.endsWith('.ts') && !line.startsWith('#')) {
+                    allSegments.push(line)
+                }
+            }
+        }
+
         if (!hasEndList) {
             return NextResponse.json({
                 valid: false,
@@ -51,15 +95,7 @@ export async function GET(
             })
         }
 
-        // 3. Extract all segment references (.ts files)
-        const segments: string[] = []
-        for (const line of lines) {
-            if (line.endsWith('.ts') && !line.startsWith('#')) {
-                segments.push(line)
-            }
-        }
-
-        if (segments.length === 0) {
+        if (allSegments.length === 0) {
             return NextResponse.json({
                 valid: false,
                 error: 'No .ts segments found in playlist',
@@ -69,14 +105,15 @@ export async function GET(
 
         // 4. Verify each segment exists and has data
         const results = {
-            totalSegments: segments.length,
+            totalSegments: allSegments.length,
             validSegments: 0,
             invalidSegments: [] as string[],
             totalSizeBytes: 0,
             totalSizeMB: 0,
+            isMasterPlaylist,
         }
 
-        for (const seg of segments) {
+        for (const seg of allSegments) {
             const segPath = path.join(movieDir, seg)
             try {
                 const segStat = await stat(segPath)
