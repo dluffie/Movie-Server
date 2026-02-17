@@ -102,13 +102,15 @@ export default function PlayerPage() {
         if (Hls.isSupported()) {
             const hls = new Hls({
                 debug: false,
-                // Optimized for low RAM (2GB device)
-                maxBufferLength: 15,           // Max 15s forward buffer
-                maxMaxBufferLength: 30,        // Absolute max 30s
-                maxBufferSize: 10 * 1024 * 1024, // 10MB max buffer
+                // Balanced for low-RAM devices
+                maxBufferLength: 30,              // 30s forward buffer
+                maxMaxBufferLength: 60,           // 60s max
+                maxBufferSize: 30 * 1024 * 1024,  // 30MB buffer
                 maxBufferHole: 0.5,
-                startFragPrefetch: false,      // Don't prefetch
-                enableWorker: false,           // Save memory — no web worker
+                startFragPrefetch: true,          // Prefetch first fragment
+                enableWorker: true,               // Use web worker for transmux
+                lowLatencyMode: false,            // VOD, not live
+                progressive: true,               // Load segments progressively
             })
             hlsRef.current = hls
 

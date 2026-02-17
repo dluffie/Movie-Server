@@ -1,11 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { stat, open } from 'fs/promises'
+import { readFile, stat } from 'fs/promises'
 import path from 'path'
-import { Readable } from 'stream'
 
 export const dynamic = 'force-dynamic'
 
-// MIME types for streaming
+// MIME types
 const MIME_MAP: Record<string, string> = {
     '.m3u8': 'application/vnd.apple.mpegurl',
     '.ts': 'video/mp2t',
@@ -33,13 +32,13 @@ export async function GET(
 
         const filePath = path.resolve('./movies', ...segments)
 
-        // Ensure the resolved path is still within movies/
+        // Ensure resolved path stays within movies/
         const moviesDir = path.resolve('./movies')
         if (!filePath.startsWith(moviesDir)) {
             return new NextResponse('Forbidden', { status: 403 })
         }
 
-        // Check file exists
+        // Check file exists & get size
         let fileStat
         try {
             fileStat = await stat(filePath)
@@ -55,18 +54,24 @@ export async function GET(
         const contentType = MIME_MAP[ext] || 'application/octet-stream'
         const fileSize = fileStat.size
 
+        // Read the entire file into memory
+        // This is fine: .ts segments are ~4MB, m3u8/posters are tiny
+        // Much more reliable than Node stream -> Web stream conversion
+        const fileBuffer = await readFile(filePath)
+
         // Common headers
         const headers: Record<string, string> = {
             'Content-Type': contentType,
+            'Accept-Ranges': 'bytes',
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, OPTIONS',
-            'Cache-Control': ext === '.m3u8' ? 'no-cache' : 'public, max-age=31536000',
+            'Cache-Control': ext === '.m3u8' ? 'no-cache, no-store' : 'public, max-age=31536000',
         }
 
-        // Handle Range requests (critical for video seeking)
+        // Handle Range requests (needed for seeking)
         const rangeHeader = req.headers.get('range')
 
-        if (rangeHeader && (ext === '.ts' || ext === '.mp4')) {
+        if (rangeHeader) {
             const match = rangeHeader.match(/bytes=(\d+)-(\d*)/)
             if (match) {
                 const start = parseInt(match[1], 10)
@@ -79,57 +84,26 @@ export async function GET(
                     })
                 }
 
-                const chunkSize = end - start + 1
+                const clampedEnd = Math.min(end, fileSize - 1)
+                const chunk = fileBuffer.subarray(start, clampedEnd + 1)
 
-                // Stream the range using file handle
-                const fileHandle = await open(filePath, 'r')
-                const stream = fileHandle.createReadStream({ start, end })
-
-                // Convert Node readable to Web ReadableStream
-                const webStream = Readable.toWeb(stream) as ReadableStream
-
-                return new NextResponse(webStream, {
+                return new NextResponse(chunk, {
                     status: 206,
                     headers: {
                         ...headers,
-                        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-                        'Content-Length': chunkSize.toString(),
-                        'Accept-Ranges': 'bytes',
+                        'Content-Range': `bytes ${start}-${clampedEnd}/${fileSize}`,
+                        'Content-Length': chunk.length.toString(),
                     }
                 })
             }
         }
 
-        // For small files (playlists, posters) — read fully
-        // For .ts segments — stream to keep RAM low
-        if (fileSize < 1024 * 512) {
-            // < 512KB: read fully (playlists, posters, subtitles)
-            const fileHandle = await open(filePath, 'r')
-            const buffer = Buffer.alloc(fileSize)
-            await fileHandle.read(buffer, 0, fileSize, 0)
-            await fileHandle.close()
-
-            return new NextResponse(buffer, {
-                status: 200,
-                headers: {
-                    ...headers,
-                    'Content-Length': fileSize.toString(),
-                    'Accept-Ranges': 'bytes',
-                }
-            })
-        }
-
-        // Large files: stream
-        const fileHandle = await open(filePath, 'r')
-        const stream = fileHandle.createReadStream()
-        const webStream = Readable.toWeb(stream) as ReadableStream
-
-        return new NextResponse(webStream, {
+        // Full file response
+        return new NextResponse(fileBuffer, {
             status: 200,
             headers: {
                 ...headers,
                 'Content-Length': fileSize.toString(),
-                'Accept-Ranges': 'bytes',
             }
         })
 
@@ -139,7 +113,7 @@ export async function GET(
     }
 }
 
-// Handle CORS preflight
+// CORS preflight
 export async function OPTIONS() {
     return new NextResponse(null, {
         status: 204,
